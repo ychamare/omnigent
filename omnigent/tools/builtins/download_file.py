@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins.upload_file import safe_resolve
 
 
 class DownloadFileTool(Tool):
@@ -112,11 +113,14 @@ class DownloadFileTool(Tool):
                 }
             )
 
-        dest = _resolve_destination(
-            args.get("destination"),
-            record.filename,
-            ctx.workspace,
-        )
+        try:
+            dest = _resolve_destination(
+                args.get("destination"),
+                record.filename,
+                ctx.workspace,
+            )
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
 
@@ -138,13 +142,18 @@ def _resolve_destination(
     """
     Resolve the save path for a downloaded file.
 
+    Both ``destination`` (LLM-supplied) and ``filename`` (from the
+    file store, set by whoever uploaded the file) are untrusted, so
+    the result is confined to the base directory; a path that would
+    escape it via ``..``, an absolute path, or a symlink is rejected.
+
     :param destination: User-specified relative path, or ``None``
         to use the original filename.
     :param filename: The file's original filename from the store.
     :param workspace: The agent's workspace directory, or ``None``.
-    :returns: Absolute path to save the file.
+    :returns: Absolute path within the base directory.
+    :raises ValueError: If the path escapes the base directory.
     """
     base = workspace or Path.cwd()
-    if destination:
-        return base / destination
-    return base / filename
+    rel_path = destination or Path(filename).name
+    return safe_resolve(rel_path, base)

@@ -348,6 +348,97 @@ def test_download_file_custom_destination(
     assert "output" in str(saved)
 
 
+def test_download_file_rejects_path_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    A ``destination`` that escapes the workspace via ``../`` is
+    rejected and nothing is written outside the workspace.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tool_ctx: Tool execution context.
+    """
+    content = b"data"
+    monkeypatch.setattr(
+        "omnigent.runtime.get_file_store",
+        lambda: _FakeFileStore(
+            [
+                _FakeFile(
+                    "file_xyz",
+                    "data.csv",
+                    len(content),
+                    "text/csv",
+                    1000,
+                    session_id="conv_alice",
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_artifact_store",
+        lambda: _FakeArtifactStore({"file_xyz": content}),
+    )
+
+    tool = DownloadFileTool()
+    result = json.loads(
+        tool.invoke(
+            '{"file_id": "file_xyz", "destination": "../../../tmp/omnigent_evil_marker.csv"}',
+            tool_ctx,
+        )
+    )
+
+    # Rejected with an error instead of a written path. The resolver
+    # raises before ``write_bytes`` is reached, so an error result means
+    # nothing was written outside the workspace.
+    assert "error" in result, f"Expected traversal to be rejected. Got: {result}"
+    assert "escape" in result["error"].lower()
+    assert "path" not in result
+
+
+def test_download_file_basenames_store_filename(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    A store filename containing path separators is reduced to a
+    basename so a malicious upload name cannot traverse out of the
+    workspace when no ``destination`` is given.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tool_ctx: Tool execution context.
+    """
+    content = b"x"
+    monkeypatch.setattr(
+        "omnigent.runtime.get_file_store",
+        lambda: _FakeFileStore(
+            [
+                _FakeFile(
+                    "file_evil",
+                    "../../escape.txt",
+                    len(content),
+                    "text/plain",
+                    1000,
+                    session_id="conv_alice",
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_artifact_store",
+        lambda: _FakeArtifactStore({"file_evil": content}),
+    )
+
+    tool = DownloadFileTool()
+    result = json.loads(tool.invoke('{"file_id": "file_evil"}', tool_ctx))
+
+    saved = Path(result["path"])
+    assert saved.name == "escape.txt"
+    # Stayed inside the workspace rather than an ancestor directory.
+    assert saved.parent == tool_ctx.workspace
+    assert saved.exists()
+
+
 def test_download_file_not_found(
     monkeypatch: pytest.MonkeyPatch,
     tool_ctx: ToolContext,
