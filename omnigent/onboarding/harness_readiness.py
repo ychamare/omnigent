@@ -101,15 +101,25 @@ def harness_is_configured(harness: str) -> bool:
     if canonical in _SDK_HARNESSES:
         return True
     if canonical == CURSOR_KEY:
-        # Cursor runs in-process via the ``cursor-sdk`` package (a baseline
-        # dependency, always importable) and authenticates against Cursor's own
-        # backend with a ``CURSOR_API_KEY`` — the SDK requires one, and a
-        # ``cursor-agent login`` does not apply. So, unlike the CLI-wrapping
-        # harnesses, there is no binary to gate on: readiness is whether a key
-        # is resolvable — one stored by ``omnigent setup`` (the ``cursor:``
-        # config block — see :mod:`omnigent.onboarding.cursor_auth`) or
-        # inherited from the environment. That is the one cursor credential the
-        # daemon can check cheaply and locally; a bad key surfaces at run time.
+        # Cursor runs in-process via the ``cursor-sdk`` package and
+        # authenticates against Cursor's own backend with a ``CURSOR_API_KEY``
+        # — the SDK requires one, and a ``cursor-agent login`` does not apply.
+        # So, unlike the CLI-wrapping harnesses, there is no binary to gate on:
+        # readiness is whether a key is resolvable — one stored by
+        # ``omnigent setup`` (the ``cursor:`` config block — see
+        # :mod:`omnigent.onboarding.cursor_auth`) or inherited from the
+        # environment. That is the one cursor credential the daemon can check
+        # cheaply and locally; a bad key surfaces at run time.
+        #
+        # ``cursor-sdk`` is now an OPTIONAL extra (it left the baseline deps),
+        # which raises the question of whether to also gate on SDK presence.
+        # We deliberately do NOT: this mirrors how ``antigravity`` — also an
+        # SDK-only, now-optional harness — is treated (it sits in
+        # ``_SDK_HARNESSES`` and is never gated, including on SDK presence). A
+        # missing SDK surfaces as the executor's own import error on the first
+        # turn (:mod:`omnigent.inner.cursor_executor`), exactly as it does for
+        # antigravity; gating on it here would only duplicate that with a less
+        # actionable message. So cursor keeps its single key-based check.
         from omnigent.onboarding.cursor_auth import cursor_api_key_configured
 
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))

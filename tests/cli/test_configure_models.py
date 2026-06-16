@@ -2047,6 +2047,120 @@ def test_cursor_set_api_key_non_crsr_declined_is_not_stored(isolated_config) -> 
     assert secrets.load_secret("cursor") is None
 
 
+# ── Cursor SDK-extra install offer (the optional ``cursor`` extra) ───────────
+# ``cursor-sdk`` left the baseline deps for an OPTIONAL extra (parity with
+# antigravity/pi), so a user can paste a ``CURSOR_API_KEY`` and still have no
+# SDK. Setup must detect that and offer to install — exactly like antigravity
+# post-#322. These tests force detection absent (the SDK is actually present in
+# the test venv).
+
+
+@pytest.fixture()
+def _cursor_sdk_absent(monkeypatch):
+    """Force ``cursor-sdk`` detection to report missing.
+
+    Both ``_run_configure_harnesses_interactive`` (overview row) and
+    ``_manage_cursor_harness`` (drill-in) resolve ``cursor_sdk_installed`` from
+    the source module at call time, so patching the module attribute is seen by
+    both.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.cursor_auth.cursor_sdk_installed",
+        lambda: False,
+    )
+
+
+def test_cursor_overview_surfaces_install_command_when_sdk_missing(
+    isolated_config, _cursor_sdk_absent
+) -> None:
+    """L1 overview: the Cursor row names the extra install command when absent.
+
+    Parallel to Antigravity post-#322 and the CLI harnesses' "not installed —
+    open to install" sub-line. The exact ``pip install "omnigent[cursor]"`` is
+    shown (escaped so the literal brackets render). Without the SDK-detection
+    branch this line never appears.
+    """
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "not installed — open to install" in out
+    # The literal command (brackets included) reaches the rendered output.
+    assert 'pip install "omnigent[cursor]"' in out
+
+
+def test_cursor_drillin_offers_install_when_sdk_missing(
+    isolated_config, _cursor_sdk_absent
+) -> None:
+    """Drilling into Cursor with the SDK absent presents the install offer.
+
+    The three-choice offer (install / set key anyway / show command) appears on
+    entry. Here the user picks "show the command" (choice 3), which prints the
+    command and falls through to the key menu, then backs out.
+    """
+    # L1 4=Cursor → install offer 3=show command → key menu q=back → L1 q.
+    stdin = "\n".join(["4", "3", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "isn't installed" in out
+    assert 'pip install "omnigent[cursor]"' in out
+
+
+def test_cursor_key_settable_when_sdk_missing(isolated_config, _cursor_sdk_absent) -> None:
+    """The Cursor key is still storable when the SDK is absent (no hard block).
+
+    This is the deliberate divergence from pi: the ``cursor:`` key is independent
+    of the SDK and useful the moment it's installed, so the drill-in offers the
+    install but does NOT gate key management on it. The user declines the install
+    ("set the key anyway" = choice 2), then sets the key — which must persist
+    exactly as it does with the SDK present.
+    """
+    # L1 4=Cursor → install offer 2=set key anyway → key menu 1=Set →
+    # paste crsr_ key → key menu q=back → L1 q=quit.
+    stdin = "\n".join(["4", "2", "1", "crsr_key_no_sdk", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["cursor"] == {"api_key_ref": "keychain:cursor"}
+    assert secrets.load_secret("cursor") == "crsr_key_no_sdk"
+
+
+def test_cursor_install_now_invokes_runner_without_index(
+    isolated_config, _cursor_sdk_absent, monkeypatch
+) -> None:
+    """Choosing "install it now" shells the install with ``omnigent[cursor]``.
+
+    Mocks the subprocess (never really installs) and asserts the argv targets the
+    extra and carries NO hardcoded index URL / proxy — pip/uv inherit the user's
+    own config. Forces the ``uv``-absent path for a deterministic argv.
+    """
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr("omnigent.onboarding.cursor_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.cursor_auth.subprocess.run", _run)
+
+    # L1 4=Cursor → install offer 1=install now → key menu q=back → L1 q.
+    stdin = "\n".join(["4", "1", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    assert len(calls) == 1, f"expected exactly one install invocation, got {calls}"
+    argv = calls[0]
+    assert "omnigent[cursor]" in argv
+    assert "install" in argv
+    # No index URL / proxy is baked into committed code.
+    assert not any("index" in part or "://" in part for part in argv)
+
+
 # ── Antigravity Gemini API-key flow ─────────────────────────────────────────
 # Antigravity (Gemini-native, no provider family) drills in at L1 row 5
 # (Claude/Codex/Pi/Antigravity/Quit) and stores its key in the secret store +
