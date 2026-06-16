@@ -1,23 +1,17 @@
 name: Security Gate
 
-# Reusable (workflow_call) gate, called as the FIRST job of each CI workflow
-# (ci/lint/e2e/e2e-ui/ap-web tests); their real jobs declare `needs: gate`.
+# Reusable (workflow_call) gate, called as the FIRST job of each CI workflow;
+# their real jobs declare `needs: gate`. Does NOT scan — the single scan runs in
+# security-scan.yml. This poller only decides whether to let its caller proceed:
+#   - non-PR event or trusted author -> proceed immediately
+#   - untrusted PR -> wait for the `Security Scan` check on the head SHA and
+#     MIRROR its conclusion (success -> proceed; failure -> fail, skipping the
+#     dependent CI jobs).
 #
-# This job does NOT scan -- the single scan runs once in security-scan.yml and
-# produces the `Security Scan` check. This poller only decides whether to let
-# its caller proceed:
-#   - non-PR event or trusted author -> proceed immediately (no scan needed)
-#   - untrusted PR -> wait for the `Security Scan` check on the PR head SHA and
-#     MIRROR its conclusion. success -> proceed; failure -> fail, so the
-#     dependent CI jobs (needs: gate) are skipped.
-#
-# Enforcement (audit vs blocking) lives in ONE place -- GATE_BLOCKING in
-# security-scan.yml. In audit mode that scan always concludes success, so this
-# poller always proceeds; flip it to "true" and a finding fails the scan, which
-# this poller then mirrors to block dependent CI. Running the scan once instead
-# of once-per-workflow is the whole point of splitting scan from gate.
-#
-# The trust decision is read from `main` (should-scan.sh) so a PR cannot edit it.
+# The scan (security-scan.yml) is blocking: a finding fails the `Security Scan`
+# check, which this poller mirrors to block dependent CI. Splitting scan from
+# gate runs the scan once, not once per workflow. The trust decision is read
+# from `main` (should-scan.sh).
 
 on:
   workflow_call:
@@ -54,8 +48,7 @@ jobs:
           bash .github/scripts/security-scan/should-scan.sh
 
       - name: Wait for Security Scan result
-        # Only untrusted PRs wait; trusted authors / non-PR events already
-        # proceeded above (scan=false), so their CI is not delayed by the scan.
+        # Only untrusted PRs wait; trusted authors / non-PR events proceeded above.
         if: ${{ steps.gate.outputs.scan == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -65,10 +58,13 @@ jobs:
           echo "Untrusted PR -- waiting for the single 'Security Scan' check on $HEAD_SHA"
           q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'
           conclusion=""
+          details_url=""
           for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
             status=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .status" 2>/dev/null || echo "")
             if [ "$status" = "completed" ]; then
               conclusion=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .conclusion")
+              # The scan's own run page -- where the findings/annotations live.
+              details_url=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .html_url")
               break
             fi
             sleep 5
@@ -80,5 +76,8 @@ jobs:
           echo "Security Scan concluded: $conclusion"
           case "$conclusion" in
             success | skipped | neutral) exit 0 ;;
-            *) echo "::error::Security Scan did not pass ($conclusion); blocking dependent CI."; exit 1 ;;
+            *)
+              echo "::error::Security Scan did not pass ($conclusion); dependent CI is blocked until it passes. See the findings: ${details_url:-the 'Security Scan' check on this PR}"
+              exit 1
+              ;;
           esac
