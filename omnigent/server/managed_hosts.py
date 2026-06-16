@@ -157,13 +157,6 @@ DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # as Daytona for long-lived hosts and stale-token cleanup.
 ISLO_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
-# Launch-token lifetime for the YAML e2b path. E2B sandboxes share
-# Modal's 24h hard cap (no never-expire option), so mirror Modal: the
-# cap plus an hour of slack, letting a live sandbox always re-authenticate
-# its tunnel across reconnects while a token from a long-dead sandbox
-# expires. A relaunch (dead-host path past the cap) mints a fresh token.
-E2B_MANAGED_TOKEN_TTL_S = 25 * 3600
-
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
 # derived from the resolved lifetime at parse time via
@@ -626,10 +619,15 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         )
         token_ttl_s = ISLO_MANAGED_TOKEN_TTL_S
     elif provider == "e2b":
+        from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s
+
         launcher_factory = _e2b_launcher_factory(
             _parse_e2b_template(raw), _parse_provider_env(raw, "e2b")
         )
-        token_ttl_s = E2B_MANAGED_TOKEN_TTL_S
+        # Derived from OMNIGENT_E2B_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) sandbox lifetime — mirrors
+        # the cwsandbox path.
+        token_ttl_s = managed_token_ttl_s()
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is

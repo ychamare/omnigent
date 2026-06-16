@@ -41,6 +41,7 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
+import re
 import shlex
 import threading
 from collections.abc import Sequence
@@ -90,12 +91,26 @@ DEFAULT_E2B_TEMPLATE: str = "omnigent-host"
 deployment that followed the guide works without extra config. Override
 with the ``template`` field or :data:`TEMPLATE_ENV_VAR`."""
 
-MAX_SANDBOX_LIFETIME_S: int = 24 * 60 * 60
-"""Sandbox ``timeout`` requested at creation and re-asserted by
-:meth:`keep_alive` — E2B's Pro-plan maximum (24 hours). The SDK default
-is only 300 s and there is no never-expire option, so this must be passed
-explicitly; on a Hobby account the account max is 1 hour and E2B clamps
-or rejects a larger request (see ``deploy/e2b/README.md``)."""
+MAX_LIFETIME_ENV_VAR: str = "OMNIGENT_E2B_MAX_LIFETIME_S"
+"""Environment variable overriding the requested sandbox lifetime in
+seconds (default :data:`_DEFAULT_MAX_LIFETIME_S`, 24 h). E2B caps lifetime
+per account — 24 h on Pro, 1 h on Hobby — and the SDK default is only
+300 s with no never-expire option, so the timeout is always passed
+explicitly. E2B *rejects* (does not clamp) a request above the account
+cap, so :meth:`E2BSandboxLauncher.provision` retries clamped to the cap;
+set this to the account maximum to skip that retry."""
+
+_DEFAULT_MAX_LIFETIME_S: int = 24 * 60 * 60  # E2B Pro-plan maximum
+# Fallback cap used when E2B rejects the requested lifetime but its error
+# doesn't state the limit — E2B's Hobby maximum (1 h).
+_HOBBY_FALLBACK_LIFETIME_S: int = 60 * 60
+# Token TTL slack: the managed launch-token must outlive the sandbox so a
+# live sandbox can re-authenticate its tunnel across reconnects.
+_TOKEN_TTL_SLACK_S: int = 3600
+
+# Matches E2B's "Timeout cannot be greater than N hours" 400 rejection so
+# provision() can retry clamped to the account's actual cap.
+_TIMEOUT_REJECTED_RE = re.compile(r"greater than\s+(\d+)\s*hour", re.IGNORECASE)
 
 # E2B caps each command at 60 s by default; 0 disables that per-command
 # limit (the SDK documents "Using 0 will not limit the command connection
@@ -105,6 +120,55 @@ _COMMAND_NO_TIMEOUT: int = 0
 # Resources (vCPU / memory) are baked into the E2B TEMPLATE at build time,
 # not passed to Sandbox.create(), so there are no _SANDBOX_CPU / _MEMORY
 # constants here — sizing lives in the template (see deploy/e2b/README.md).
+
+
+def resolve_max_lifetime_s() -> int:
+    """
+    Resolve the requested sandbox lifetime in seconds.
+
+    :data:`MAX_LIFETIME_ENV_VAR` overrides the 24 h default.
+
+    :returns: The lifetime to request at sandbox creation.
+    :raises click.ClickException: When the env override is not a number.
+    """
+    raw = os.environ.get(MAX_LIFETIME_ENV_VAR)
+    if raw is None:
+        return _DEFAULT_MAX_LIFETIME_S
+    try:
+        return int(float(raw))
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{MAX_LIFETIME_ENV_VAR} must be a number of seconds"
+        ) from exc
+
+
+def managed_token_ttl_s() -> int:
+    """
+    Launch-token TTL for the managed path, derived from (and always above)
+    the sandbox lifetime so the token outlives the sandbox across tunnel
+    reconnects.
+
+    :returns: The token lifetime in seconds.
+    """
+    return resolve_max_lifetime_s() + _TOKEN_TTL_SLACK_S
+
+
+def _lifetime_cap_from_error(message: str) -> int | None:
+    """
+    Extract the account's max lifetime (seconds) from E2B's
+    timeout-too-large 400 rejection.
+
+    :param message: The SDK exception's string form, e.g.
+        ``"400: Timeout cannot be greater than 1 hours"``.
+    :returns: The cap in seconds (``3600`` for the example), or ``None``
+        when the error is not that rejection (so the caller re-raises it).
+    """
+    match = _TIMEOUT_REJECTED_RE.search(message)
+    if match:
+        return int(match.group(1)) * 3600
+    if "Timeout cannot be greater than" in message:
+        return _HOBBY_FALLBACK_LIFETIME_S
+    return None
 
 
 def _ensure_sdk() -> None:
@@ -373,12 +437,14 @@ class E2BSandboxLauncher(SandboxLauncher):
         """
         Create a new E2B sandbox from the host template.
 
-        The sandbox is created at E2B's Pro-plan maximum lifetime
-        (24 hours); the SDK default is only 300 s and there is no
-        never-expire option, so the timeout is passed explicitly. The
-        sandbox lives until the managed-session machinery terminates it
-        or the timeout lapses (a managed host outliving 24 h relies on
-        the dead-sandbox relaunch path).
+        The sandbox is created at the requested lifetime
+        (:func:`resolve_max_lifetime_s`, default E2B's 24 h Pro maximum);
+        the SDK default is only 300 s and there is no never-expire option,
+        so the timeout is passed explicitly. E2B *rejects* a request above
+        the account cap (e.g. a Hobby account's 1 h), so creation retries
+        once clamped to that cap. The sandbox lives until the managed-
+        session machinery terminates it or the timeout lapses (a managed
+        host outliving the cap relies on the dead-sandbox relaunch path).
 
         :param name: Human-readable label, e.g. ``"managed-a1b2c3d4"``.
             Recorded as sandbox metadata; the returned id is the
@@ -388,18 +454,37 @@ class E2BSandboxLauncher(SandboxLauncher):
             template that has not been built yet).
         """
         _ensure_sdk()
-        from e2b import Sandbox
-        from e2b.exceptions import SandboxException, TemplateException
-
         template = self._resolved_template()
         env_vars = self._resolve_sandbox_env()
         click.echo(f"▸ Creating E2B sandbox '{name}' from template '{template}'")
+        sandbox = self._create_sandbox(template, resolve_max_lifetime_s(), name, env_vars)
+        sandbox_id = sandbox.sandbox_id
+        self._sandboxes[sandbox_id] = sandbox
+        click.echo(f"  → created {sandbox_id}")
+        return sandbox_id
+
+    def _create_sandbox(
+        self, template: str, timeout: int, name: str, env_vars: dict[str, str]
+    ) -> Sandbox:
+        """
+        Create one sandbox, retrying once clamped to the account's cap if
+        E2B rejects the requested lifetime as too large.
+
+        :param template: E2B template name to boot from.
+        :param timeout: Requested lifetime in seconds.
+        :param name: Human-readable label (recorded as metadata).
+        :param env_vars: Resolved env vars to inject (empty for none).
+        :returns: The created sandbox handle.
+        :raises click.ClickException: If creation fails for any reason
+            other than a clampable timeout rejection.
+        """
+        from e2b import Sandbox
+        from e2b.exceptions import SandboxException, TemplateException
+
+        metadata = {"omnigent-name": name}
         try:
-            sandbox = Sandbox.create(
-                template=template,
-                timeout=MAX_SANDBOX_LIFETIME_S,
-                metadata={"omnigent-name": name},
-                envs=env_vars or None,
+            return Sandbox.create(
+                template=template, timeout=timeout, metadata=metadata, envs=env_vars or None
             )
         except TemplateException as exc:
             # The most common first-run failure: the host image was never
@@ -412,14 +497,27 @@ class E2BSandboxLauncher(SandboxLauncher):
                 f"({exc})"
             ) from exc
         except SandboxException as exc:
-            # SDK boundary: surface the provider's reason (quota, auth, …)
-            # as the launcher-contract error type so the managed-launch
-            # 502 carries it verbatim instead of a generic "internal error".
+            cap = _lifetime_cap_from_error(str(exc))
+            if cap is None or cap >= timeout:
+                # SDK boundary: surface the provider's reason (quota, auth,
+                # …) as the launcher-contract error type so the managed-
+                # launch 502 carries it verbatim, not a generic message.
+                raise click.ClickException(f"E2B sandbox creation failed: {exc}") from exc
+        # The requested lifetime exceeds this account's maximum (e.g. a
+        # Hobby account's 1 h cap vs the 24 h default) and E2B rejected it
+        # rather than clamping — retry once at the cap.
+        click.secho(
+            f"  → requested {timeout // 3600}h lifetime exceeds this E2B account's "
+            f"maximum ({cap // 3600}h); retrying clamped to it (set "
+            f"{MAX_LIFETIME_ENV_VAR} to request a specific lifetime).",
+            fg="yellow",
+        )
+        try:
+            return Sandbox.create(
+                template=template, timeout=cap, metadata=metadata, envs=env_vars or None
+            )
+        except SandboxException as exc:
             raise click.ClickException(f"E2B sandbox creation failed: {exc}") from exc
-        sandbox_id = sandbox.sandbox_id
-        self._sandboxes[sandbox_id] = sandbox
-        click.echo(f"  → created {sandbox_id}")
-        return sandbox_id
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -440,21 +538,23 @@ class E2BSandboxLauncher(SandboxLauncher):
 
     def keep_alive(self, sandbox_id: str) -> None:
         """
-        Re-extend the sandbox timeout to the 24 h maximum.
+        Re-extend the sandbox timeout to the requested lifetime.
 
         E2B exposes no idle-autostop to disable and no never-expire
         option, so the best available keep-alive is to set the timeout to
-        the account maximum, measured from now. Soft-fail per the
-        launcher contract: a rejected setting (e.g. a Hobby account whose
-        max is 1 h) warns rather than aborting the bootstrap.
+        the requested maximum (:func:`resolve_max_lifetime_s`), measured
+        from now. Soft-fail per the launcher contract: a rejected setting
+        (e.g. a Hobby account whose max is below the request) warns rather
+        than aborting the bootstrap.
 
         :param sandbox_id: The sandbox to configure.
         """
         from e2b.exceptions import SandboxException
 
+        lifetime = resolve_max_lifetime_s()
         handle = self._resolve(sandbox_id)
         try:
-            handle.set_timeout(MAX_SANDBOX_LIFETIME_S)
+            handle.set_timeout(lifetime)
         except SandboxException as exc:
             click.secho(
                 f"  → warning: could not extend the lifetime of '{sandbox_id}' "
@@ -462,9 +562,11 @@ class E2BSandboxLauncher(SandboxLauncher):
                 fg="yellow",
             )
         else:
+            # set_timeout clamps to the account cap silently (unlike create,
+            # which rejects), so report the REQUEST rather than claim a grant.
             click.echo(
-                f"  → lifetime extended to {MAX_SANDBOX_LIFETIME_S // 3600}h "
-                "(E2B has no idle-stop disable; re-extended on reconnect)."
+                f"  → requested a {lifetime // 3600}h lifetime extension "
+                "(capped at the account maximum; E2B has no idle-stop disable)."
             )
 
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:

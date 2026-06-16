@@ -11,11 +11,11 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
     DAYTONA_MANAGED_TOKEN_TTL_S,
-    E2B_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
@@ -287,7 +287,7 @@ def test_parse_valid_e2b_config_builds_parameterized_factory(
     )
     assert cfg is not None
     assert cfg.server_url == "https://srv.example.com"
-    assert cfg.token_ttl_s == E2B_MANAGED_TOKEN_TTL_S
+    assert cfg.token_ttl_s == e2b_managed_token_ttl_s()
     assert cfg.managed_launch_supported is True
     assert cfg.provider == "e2b"
     fake = FakeSandboxLauncher()

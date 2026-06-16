@@ -33,8 +33,8 @@ import time
 # omnigent package) isn't importable rather than a raw traceback.
 try:
     from omnigent.onboarding.sandboxes.e2b import (
-        MAX_SANDBOX_LIFETIME_S,
         E2BSandboxLauncher,
+        resolve_max_lifetime_s,
     )
 except ImportError as exc:  # pragma: no cover - environment guard
     print(f"ERROR: cannot import the launcher ({exc}).", file=sys.stderr)
@@ -122,7 +122,7 @@ def main() -> int:
 
         print("\n[6/8] keep_alive (set_timeout to max) + attach (connect + is_running)")
         launcher.keep_alive(sandbox_id)  # soft-fail; must not raise
-        _check(failures, True, f"keep_alive extended (target {MAX_SANDBOX_LIFETIME_S // 3600}h)")
+        _check(failures, True, f"keep_alive extended (target {resolve_max_lifetime_s() // 3600}h)")
         # Fresh launcher to force a real Sandbox.connect (not the cached handle).
         E2BSandboxLauncher(template=args.template).attach(sandbox_id)
         _check(failures, True, "attach validated a running sandbox")

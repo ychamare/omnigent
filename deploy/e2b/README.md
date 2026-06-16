@@ -40,11 +40,13 @@ e2b auth login                # one-time, authenticates the E2B CLI too
 > **Lifetime is capped and cannot be disabled.** An E2B sandbox carries a
 > single timeout (default 5 minutes; account maximum **24 h on Pro, 1 h on
 > Hobby**) with no "never expire" option. Omnigent requests the 24 h
-> maximum at creation and re-extends it on every reconnect, but a managed
-> session outliving the cap relies on the dead-sandbox relaunch path (same
-> posture as Modal's 24 h limit). A **Pro account** is recommended for
-> anything beyond short demos — on Hobby, `provision` requests 24 h and
-> E2B clamps it to 1 h.
+> maximum at creation, but E2B **rejects** (does not clamp) a request above
+> the account cap, so `provision` automatically **retries clamped to the
+> account's maximum** (e.g. 1 h on Hobby) — verified live. Set
+> `OMNIGENT_E2B_MAX_LIFETIME_S` to request a specific lifetime and skip the
+> retry. A managed session outliving the cap relies on the dead-sandbox
+> relaunch path (same posture as Modal's 24 h limit), so a **Pro account**
+> is recommended for anything beyond short demos.
 
 ## Build the host template (one time)
 
@@ -238,16 +240,19 @@ Modal guide.
   couldn't dial back to `server_url`. Confirm it's a public HTTPS URL
   reachable from E2B's cloud (not `localhost`), and check
   `/tmp/omnigent-host.log` inside the sandbox.
-- **Sandbox stops after ~1 hour** — you're on a Hobby account (1 h cap).
-  Upgrade to Pro for the 24 h maximum, or expect the dead-sandbox
-  relaunch path to re-provision on the next message.
+- **Sandbox stops after ~1 hour** — you're on a Hobby account (1 h cap);
+  `provision` auto-clamps to it (you'll see a one-line warning). Upgrade
+  to Pro for the 24 h maximum, or expect the dead-sandbox relaunch path to
+  re-provision on the next message.
 
 ## Lifecycle notes
 
-- **Hard lifetime cap, no idle-stop disable.** `provision` requests the
-  24 h Pro maximum and `keep_alive` re-extends a live sandbox to it on
-  reconnect, but there is no never-expire option. A managed session past
-  the cap is replaced by the dead-sandbox relaunch path (same as Modal).
+- **Hard lifetime cap, no idle-stop disable.** `provision` requests
+  `OMNIGENT_E2B_MAX_LIFETIME_S` (default the 24 h Pro maximum); E2B rejects
+  a request above the account cap, so creation retries clamped to it (e.g.
+  1 h on Hobby). `keep_alive` re-extends a live sandbox on reconnect, but
+  there is no never-expire option — a managed session past the cap is
+  replaced by the dead-sandbox relaunch path (same as Modal).
 - **Templates, not registry images.** See
   [Build the host template](#build-the-host-template-one-time). Resources
   (vCPU / memory) are fixed when the template is built — pass
@@ -264,3 +269,4 @@ Modal guide.
 | `E2B_API_KEY` | CLI machine / server | E2B API credentials (required) |
 | `OMNIGENT_E2B_TEMPLATE` | CLI machine / server | E2B template name to provision from (`sandbox.e2b.template` takes precedence; default `omnigent-host`) |
 | `OMNIGENT_E2B_SANDBOX_ENV` | CLI machine / server | Comma-separated launcher-side env var names to inject (`sandbox.e2b.env` takes precedence for managed) |
+| `OMNIGENT_E2B_MAX_LIFETIME_S` | CLI machine / server | Requested sandbox lifetime in seconds (default 24 h); creation auto-clamps to the account cap if exceeded |

@@ -13,10 +13,10 @@ import pytest
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.onboarding.sandboxes.e2b import (
     DEFAULT_E2B_TEMPLATE,
-    MAX_SANDBOX_LIFETIME_S,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     TEMPLATE_ENV_VAR,
     E2BSandboxLauncher,
+    resolve_max_lifetime_s,
 )
 
 # ── Fake e2b SDK ────────────────────────────────────────────
@@ -65,6 +65,7 @@ class _State:
     """Shared recorder for assertions."""
 
     create_kwargs: dict = field(default_factory=dict)
+    create_calls: list[dict] = field(default_factory=list)
     run_calls: list[dict] = field(default_factory=list)
     written: list[tuple[str, bytes]] = field(default_factory=list)
     killed: list[str] = field(default_factory=list)
@@ -76,6 +77,9 @@ class _State:
     kill_missing: bool = False
     set_timeout_raises: bool = False
     create_raises: BaseException | None = None
+    # When set, create() rejects (like E2B's 400) any timeout above this many
+    # seconds, reporting the cap in hours — drives the clamp-and-retry test.
+    reject_timeout_over: int | None = None
     handle_killed: bool = False
 
 
@@ -140,8 +144,13 @@ class _FakeSandbox:
     @classmethod
     def create(cls, **kwargs) -> _FakeSandbox:
         cls._state.create_kwargs = kwargs
+        cls._state.create_calls.append(kwargs)
         if cls._state.create_raises is not None:
             raise cls._state.create_raises
+        cap = cls._state.reject_timeout_over
+        if cap is not None and kwargs.get("timeout", 0) > cap:
+            # Mirror E2B's 400 rejection of an over-cap lifetime.
+            raise _SandboxException(f"400: Timeout cannot be greater than {cap // 3600} hours")
         return cls()
 
     @classmethod
@@ -212,7 +221,7 @@ def test_prepare_raises_install_hint_when_sdk_missing(monkeypatch: pytest.Monkey
 def test_provision_uses_default_template_and_max_timeout(sdk: _State) -> None:
     assert E2BSandboxLauncher().provision("managed-x") == "sb-e2b-1"
     assert sdk.create_kwargs["template"] == DEFAULT_E2B_TEMPLATE
-    assert sdk.create_kwargs["timeout"] == MAX_SANDBOX_LIFETIME_S
+    assert sdk.create_kwargs["timeout"] == resolve_max_lifetime_s()
     assert sdk.create_kwargs["metadata"] == {"omnigent-name": "managed-x"}
     # No env configured → nothing injected.
     assert sdk.create_kwargs["envs"] is None
@@ -255,6 +264,23 @@ def test_provision_sandbox_error_surfaces_reason(sdk: _State) -> None:
     sdk.create_raises = _SandboxException("quota exceeded")
     with pytest.raises(click.ClickException, match="quota exceeded"):
         E2BSandboxLauncher().provision("x")
+
+
+def test_provision_clamps_lifetime_when_account_cap_rejects(sdk: _State) -> None:
+    # E2B rejects (HTTP 400) — not clamps — a lifetime above the account cap
+    # (e.g. Hobby's 1h vs the 24h default). provision must retry clamped to it.
+    sdk.reject_timeout_over = 3600  # 1h cap
+    assert E2BSandboxLauncher().provision("x") == "sb-e2b-1"
+    timeouts = [call["timeout"] for call in sdk.create_calls]
+    assert timeouts == [resolve_max_lifetime_s(), 3600]  # requested 24h, retried at 1h
+
+
+def test_provision_env_override_skips_retry(sdk: _State, monkeypatch: pytest.MonkeyPatch) -> None:
+    # With the lifetime pinned to the account cap, provision succeeds first try.
+    monkeypatch.setenv("OMNIGENT_E2B_MAX_LIFETIME_S", "3600")
+    sdk.reject_timeout_over = 3600
+    E2BSandboxLauncher().provision("x")
+    assert [call["timeout"] for call in sdk.create_calls] == [3600]
 
 
 # ── run ─────────────────────────────────────────────────────
@@ -323,7 +349,7 @@ def test_resolve_missing_sandbox_is_friendly(sdk: _State) -> None:
 
 def test_keep_alive_extends_to_max(sdk: _State) -> None:
     E2BSandboxLauncher().keep_alive("sb-e2b-1")
-    assert sdk.set_timeouts == [MAX_SANDBOX_LIFETIME_S]
+    assert sdk.set_timeouts == [resolve_max_lifetime_s()]
 
 
 def test_keep_alive_soft_fails(sdk: _State) -> None:
