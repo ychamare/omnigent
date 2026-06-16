@@ -6696,6 +6696,71 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_claude_native_permission_mode_change(
+        conv_id: str,
+        terminal_launch_args: list[str] | None,
+    ) -> Response:
+        """
+        Type ``/permissions <mode>`` into Claude's tmux pane.
+
+        Claude-native sessions bake ``--permission-mode`` into the
+        ``claude`` binary at spawn. To propagate a live change without
+        restarting the pane, this helper types Claude Code's built-in
+        ``/permissions`` slash command into the terminal.
+
+        The mode is extracted from ``terminal_launch_args``: the
+        ``--permission-mode <value>`` pair the frontend persists.
+        Skipped silently when the args don't contain a mode flag or
+        are empty (the default applies on next spawn).
+
+        :param conv_id: Session/conversation identifier.
+        :param terminal_launch_args: Persisted CLI args, e.g.
+            ``["--permission-mode", "acceptEdits"]``.
+        :returns: 204 on success or skip; 503 on tmux failure.
+        """
+        from omnigent.claude_native_bridge import (
+            bridge_dir_for_bridge_id,
+            inject_slash_command,
+        )
+
+        # Extract the mode value from the args list.
+        mode: str | None = None
+        if terminal_launch_args:
+            try:
+                idx = terminal_launch_args.index("--permission-mode")
+                if idx + 1 < len(terminal_launch_args):
+                    mode = terminal_launch_args[idx + 1]
+            except ValueError:
+                pass
+        if mode is None:
+            return Response(status_code=204)
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        command = f"/permissions {mode}"
+        try:
+            await asyncio.to_thread(
+                inject_slash_command,
+                bridge_dir,
+                command=command,
+                timeout_s=1.0,
+                auto_confirm=True,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_permission_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="claude-native permission mode change"
+                    ),
+                },
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         """
         Type ``/compact`` into Claude's tmux pane.
@@ -9511,6 +9576,20 @@ def create_runner_app(
                 return await _handle_claude_native_model_change(
                     conversation_id,
                     model,
+                )
+            return Response(status_code=204)
+
+        if body_type == "permission_mode_change":
+            # Omnigent server forwards a terminal_launch_args change here
+            # so claude-native sessions can propagate a permission mode
+            # switch into the running pane via ``/permissions <mode>``.
+            # Other harnesses 204 no-op — the persisted value applies on
+            # the next spawn.
+            if _session_harness_name(conversation_id) == "claude-native":
+                args = body.get("terminal_launch_args") if isinstance(body, dict) else None
+                return await _handle_claude_native_permission_mode_change(
+                    conversation_id,
+                    args,
                 )
             return Response(status_code=204)
 
