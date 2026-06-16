@@ -28,13 +28,32 @@ Streaming model:
 - Cancellation: :meth:`interrupt_session` -> ``conversation.cancel()``, which
   surfaces ``TurnCancelled``.
 
+Policy enforcement mirrors the peer SDK executors so operator guardrails apply
+to this runtime too:
+
+- TOOL_CALL phase: a registered ``PreToolCallDecideHook`` consults the
+  executor's ``_policy_evaluator`` BEFORE each tool runs. A DENY verdict blocks
+  the call (the SDK rejects it without executing the tool — for both its
+  bundled native tools and the bridged Omnigent tools, see
+  :meth:`_build_pre_tool_hook`); an ASK verdict routes through the executor's
+  ``_elicitation_handler`` (deny when none is wired). This is the
+  ``can_use_tool`` gate of :class:`~omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor`,
+  expressed through the SDK's decide-hook surface.
+- LLM_REQUEST / LLM_RESPONSE phases: :meth:`run_turn` evaluates these around
+  the model call (deny-before-spawn / deny-after-stream), matching the peer
+  executors so prompt-deny and output-block policies are honored.
+
+Both ``_policy_evaluator`` and ``_elicitation_handler`` are wired in by the
+harness ExecutorAdapter; every phase is a no-op when the evaluator is absent.
+
 Authentication is Gemini-native: a direct API key (``api_key``) or Vertex AI
 (``vertex`` + ``project`` + ``location``). The SDK has no OpenAI-compatible
 ``base_url``, so there is deliberately no gateway / Databricks routing path.
 
 SDK touchpoints are isolated in :meth:`_open_agent`, :meth:`_build_sdk_tools`,
-:meth:`_build_post_tool_hook`, and :meth:`_drive_turn`, and duck-typed to
-tolerate drift across the v0.1.x surface. Unit tests stub the SDK module.
+:meth:`_build_post_tool_hook`, :meth:`_build_pre_tool_hook`, and
+:meth:`_drive_turn`, and duck-typed to tolerate drift across the v0.1.x
+surface. Unit tests stub the SDK module.
 """
 
 from __future__ import annotations
@@ -97,6 +116,7 @@ SDKToolResult: TypeAlias = Any  # type: ignore[explicit-any]
 SDKUsage: TypeAlias = Any  # type: ignore[explicit-any]
 SDKTool: TypeAlias = Any  # type: ignore[explicit-any]
 SDKHook: TypeAlias = Any  # type: ignore[explicit-any]
+SDKHookResult: TypeAlias = Any  # type: ignore[explicit-any]
 SDKConfig: TypeAlias = Any  # type: ignore[explicit-any]
 SDKHookContext: TypeAlias = Any  # type: ignore[explicit-any]
 ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
@@ -113,6 +133,24 @@ _ToolCallable: TypeAlias = Callable[..., Awaitable[ToolResult]]  # type: ignore[
 # sys / sub-agent / MCP tools under policy.
 ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
     [str, dict[str, Any]], Awaitable[dict[str, Any]]
+]
+
+# Elicitation handler the harness ExecutorAdapter wires in. Returns whether
+# the user approves a tool call. Kept SDK-agnostic (a plain async callable) so
+# this module need not import the adapter's verdict / elicitation types —
+# mirrors :data:`omnigent.inner.claude_sdk_executor.ElicitationHandler`.
+ElicitationHandler: TypeAlias = Callable[  # type: ignore[explicit-any]
+    [str, dict[str, Any]], Awaitable[bool]
+]
+
+# Policy-evaluation callback the harness ExecutorAdapter wires in (assigns
+# ``executor._policy_evaluator``). Called with a proto-style phase string
+# (``"PHASE_TOOL_CALL"`` / ``"PHASE_LLM_REQUEST"`` / ``"PHASE_LLM_RESPONSE"``)
+# and an event-data dict; returns a verdict object exposing ``.action`` (e.g.
+# ``"POLICY_ACTION_DENY"``) and ``.reason``. Typed structurally as ``Any`` so
+# this module stays decoupled from the adapter's ``PolicyVerdictPayload``.
+PolicyEvaluator: TypeAlias = Callable[  # type: ignore[explicit-any]
+    [str, dict[str, Any]], Awaitable[Any]
 ]
 
 
@@ -357,6 +395,23 @@ class AntigravityExecutor(Executor):
         # Set by the harness ExecutorAdapter when unset; the SDK tools route
         # invocations through this to reach Omnigent's tools under policy.
         self._tool_executor: ToolExecutor | None = None
+        # Elicitation handler wired in by ExecutorAdapter. When set, a
+        # TOOL_CALL-phase ASK verdict is resolved by an async approve/deny
+        # round-trip through the Omnigent elicitation system; ``None`` until
+        # the adapter installs it (an ASK then fails closed → deny).
+        self._elicitation_handler: ElicitationHandler | None = None
+        # Policy evaluator wired in by ExecutorAdapter (assigned to
+        # ``_policy_evaluator`` when unset). Accessed via ``getattr`` at use
+        # sites — same pattern as the peer SDK executors — so every policy
+        # phase is a no-op until the adapter installs it. Declared here for
+        # discoverability; the adapter owns assignment.
+        self._policy_evaluator: PolicyEvaluator | None = None
+        # Names of the tools bridged through ``_tool_executor`` this turn (the
+        # Omnigent tools exposed as SDK callables). The pre-tool decide hook
+        # skips these — they are TOOL_CALL-gated server-side on the dispatch
+        # path — and gates everything else (chiefly the SDK's native tools).
+        # Refreshed at the start of each turn from the turn's tool set.
+        self._bridged_tool_names: frozenset[str] = frozenset()
 
     def supports_streaming(self) -> bool:
         return True
@@ -471,6 +526,28 @@ class AntigravityExecutor(Executor):
         )
         session_key = self._session_key(messages)
         prompt = _latest_user_text(messages)
+        # Names of the tools bridged through the dispatch path this turn; the
+        # pre-tool decide hook reads this to skip already-gated bridged tools.
+        self._bridged_tool_names = self._bridged_tool_name_set(tools)
+
+        # ── LLM_REQUEST policy evaluation ────────────────────────
+        # Mirror the peer executors: when the adapter wired a policy evaluator,
+        # evaluate the request before the model call (the producer's
+        # ``conversation.send()``) so a DENY aborts the turn without spawning it.
+        policy_eval = getattr(self, "_policy_evaluator", None)
+        if policy_eval is not None:
+            req_data: _StrAnyDict = {
+                "model": model,
+                "messages_count": len(messages),
+                "tools_count": len(tools),
+                "system_prompt_preview": (system_prompt[:200] if system_prompt else ""),
+                "last_user_message": prompt[:500],
+            }
+            req_verdict = await policy_eval("PHASE_LLM_REQUEST", req_data)
+            if getattr(req_verdict, "action", None) == "POLICY_ACTION_DENY":
+                deny_reason = getattr(req_verdict, "reason", None) or "no reason given"
+                yield ExecutorError(message=f"LLM call denied by policy: {deny_reason}")
+                return
 
         try:
             state, created = await self._ensure_agent(
@@ -510,6 +587,7 @@ class AntigravityExecutor(Executor):
             name=f"antigravity-turn:{session_key}",
         )
         final_text_parts: list[str] = []
+        tool_calls_count = 0
         cancelled = False
         errored = False
         try:
@@ -527,6 +605,8 @@ class AntigravityExecutor(Executor):
                     continue
                 if isinstance(item, TextChunk):
                     final_text_parts.append(item.text)
+                elif isinstance(item, ToolCallRequest):
+                    tool_calls_count += 1
                 yield item
         finally:
             state.active_queue = None
@@ -544,11 +624,31 @@ class AntigravityExecutor(Executor):
             yield TurnCancelled(reason="user_cancelled", phase="model")
             return
         usage = self._extract_usage(state.last_usage)
+        response_text = "".join(final_text_parts) or None
+
+        # ── LLM_RESPONSE policy evaluation ───────────────────────
+        # Mirror the peer executors: evaluate after the stream completes but
+        # before TurnComplete so a DENY blocks the response from being
+        # persisted / shown.
+        if policy_eval is not None:
+            resp_data: _StrAnyDict = {
+                "model": model,
+                "text_preview": (response_text[:500] if response_text else ""),
+                "tool_calls_count": tool_calls_count,
+            }
+            if usage is not None:
+                resp_data["usage"] = usage
+            resp_verdict = await policy_eval("PHASE_LLM_RESPONSE", resp_data)
+            if getattr(resp_verdict, "action", None) == "POLICY_ACTION_DENY":
+                deny_reason = getattr(resp_verdict, "reason", None) or "no reason given"
+                yield ExecutorError(message=f"LLM response denied by policy: {deny_reason}")
+                return
+
         # Notify in-process usage subscribers (and the auto-recorder) before the
         # terminal event, matching the peer SDK executors so antigravity turns
         # are not invisible to usage observers. No-op for an empty usage dict.
         _notify_usage_from_dict(model=model, usage=usage)
-        yield TurnComplete(response="".join(final_text_parts) or None, usage=usage)
+        yield TurnComplete(response=response_text, usage=usage)
 
     # ── SDK touchpoints (isolated; duck-typed; verified against v0.1.x) ──
 
@@ -805,8 +905,11 @@ class AntigravityExecutor(Executor):
         resolved model / prompt / credentials / tools / hooks and enters the
         agent's async context. Omnigent's tools are exposed as callables
         (``LocalAgentConfig.tools``) routing through :attr:`_tool_executor`, so
-        the agent runs them under policy. A ``PostToolCallHook`` surfaces a
-        :class:`ToolCallComplete` for every tool the agent runs.
+        the agent runs them under policy. Two hooks are registered: a
+        ``PreToolCallDecideHook`` that gates every tool against Omnigent's
+        TOOL_CALL policy BEFORE it runs (see :meth:`_build_pre_tool_hook`), and
+        a ``PostToolCallHook`` that surfaces a :class:`ToolCallComplete` for
+        every tool the agent runs.
 
         :param state: The session state the tool-completion hook closes over.
         :param model: The resolved model id to pin.
@@ -819,13 +922,133 @@ class AntigravityExecutor(Executor):
         sdk_tools = self._build_sdk_tools(tools)
         if sdk_tools:
             config_kwargs["tools"] = sdk_tools
-        config_kwargs["hooks"] = [self._build_post_tool_hook(antigravity, state)]
+        # The pre-tool decide hook runs first so a policy DENY blocks execution
+        # before the post-tool hook (which only observes completed calls).
+        config_kwargs["hooks"] = [
+            self._build_pre_tool_hook(antigravity),
+            self._build_post_tool_hook(antigravity, state),
+        ]
         config = self._build_local_agent_config(antigravity, model=model, kwargs=config_kwargs)
         agent = antigravity.Agent(config)
         # Agent is documented as an async context manager; enter it if so.
         if hasattr(agent, "__aenter__"):
             agent = await agent.__aenter__()
         return agent
+
+    async def _evaluate_tool_call_policy(
+        self, tool_name: str, tool_args: ToolArgs
+    ) -> tuple[bool, str]:
+        """Run a pre-execution TOOL_CALL policy evaluation for one tool call.
+
+        The policy half of the SDK's pre-tool decide gate, mirroring
+        :meth:`omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor._evaluate_tool_call_policy`.
+        Consults :attr:`_policy_evaluator` for the ``PHASE_TOOL_CALL`` phase and
+        collapses the verdict to an allow/deny pair the SDK hook can return:
+
+        - **ALLOW / no-match / no evaluator** -> ``(True, "")`` (proceed).
+        - **DENY** -> ``(False, reason)`` (the SDK rejects the call so the tool
+          never runs).
+        - **ASK** -> route through :attr:`_elicitation_handler`; ``(True, "")``
+          on approval, ``(False, reason)`` on decline or when no handler is
+          wired (fail closed). A raw ASK normally only reaches here on a
+          read-only evaluation path — the server usually collapses ASK to a
+          hard ALLOW/DENY first.
+        - **Unexpected verdict** -> ``(False, reason)`` (fail closed).
+
+        :param tool_name: The tool's wire name, e.g. ``"run_command"`` (a
+            bundled native tool) or ``"sys_shell"`` (a bridged Omnigent tool).
+        :param tool_args: The tool call's argument dict.
+        :returns: ``(allow, reason)`` — *reason* is the deny message surfaced
+            to the model (empty when *allow* is ``True``).
+        """
+        policy_eval = getattr(self, "_policy_evaluator", None)
+        if policy_eval is None:
+            return True, ""
+        verdict = await policy_eval(
+            "PHASE_TOOL_CALL",
+            {"name": tool_name, "arguments": tool_args},
+        )
+        action = getattr(verdict, "action", None)
+        if action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED", None):
+            return True, ""
+        reason = getattr(verdict, "reason", None)
+        if action == "POLICY_ACTION_ASK":
+            ask_reason = reason or "Approval required by Omnigent TOOL_CALL policy"
+            if self._elicitation_handler is None:
+                logger.warning(
+                    "TOOL_CALL policy ASK had no elicitation handler; denying tool=%s reason=%s",
+                    tool_name,
+                    ask_reason,
+                )
+                return False, ask_reason
+            logger.info(
+                "TOOL_CALL policy requested approval tool=%s reason=%s", tool_name, ask_reason
+            )
+            if await self._elicitation_handler(tool_name, tool_args):
+                return True, ""
+            return False, ask_reason
+        if action == "POLICY_ACTION_DENY":
+            deny_reason = reason or "Denied by Omnigent TOOL_CALL policy"
+            logger.info("TOOL_CALL policy denied tool=%s reason=%s", tool_name, deny_reason)
+            return False, deny_reason
+        fail_reason = f"Unexpected Omnigent TOOL_CALL policy verdict: {action!r}"
+        logger.warning("TOOL_CALL policy failed closed tool=%s reason=%s", tool_name, fail_reason)
+        return False, fail_reason
+
+    def _build_pre_tool_hook(self, antigravity: ModuleType) -> SDKHook:
+        """Build a ``PreToolCallDecideHook`` that enforces TOOL_CALL policy.
+
+        The SDK invokes this BEFORE every tool runs with the pending
+        ``ToolCall`` and honors the returned ``HookResult``: ``allow=False``
+        rejects the call so the tool never executes — for BOTH the SDK's
+        bundled native tools (``run_command``, file ops; gated in the SDK's
+        ``_handle_tool_confirmation_request``) AND the bridged Omnigent tools
+        (gated in the SDK's ``_handle_tool_call`` before it reaches the
+        host-side runner). This is the executor's analogue of
+        claude-sdk's ``can_use_tool`` gate.
+
+        Double-evaluation guard: the bridged Omnigent tools (the ``tools`` the
+        executor exposed for this turn) route through :attr:`_tool_executor` ->
+        ``TurnContext.dispatch_tool`` -> the runner's ``ProxyMcpManager``, which
+        ALREADY enforces TOOL_CALL + TOOL_RESULT policies server-side (see
+        ``omnigent/runner/app.py`` "All tool calls go through AP:/mcp ... which
+        enforces TOOL_CALL + TOOL_RESULT policies server-side"). Re-evaluating
+        them here would double-count the same call (and could double-charge a
+        cost-budget checkpoint), so the hook SKIPS bridged tool names and only
+        gates the tools the dispatch path never sees — chiefly the SDK's
+        bundled native tools. This mirrors claude-sdk skipping its
+        ``mcp__omnigent__*`` prefix for the same reason.
+
+        Defined inline because its base class only exists once the SDK is
+        imported. Closes over the executor (``self``) so the gate reads the
+        live :attr:`_policy_evaluator` / :attr:`_elicitation_handler`.
+
+        :param antigravity: The imported ``google.antigravity`` module.
+        :returns: A ``PreToolCallDecideHook`` for ``LocalAgentConfig.hooks``.
+        """
+        executor = self
+
+        class _OmnigentToolPolicyHook(antigravity.hooks.PreToolCallDecideHook):  # type: ignore[misc, name-defined]
+            """Gates each SDK ``ToolCall`` against Omnigent's TOOL_CALL policy."""
+
+            async def run(self, context: SDKHookContext, data: SDKToolCall) -> SDKHookResult:  # noqa: ARG002 — context unused; required by hook signature
+                """Allow or deny one pending tool call before it runs.
+
+                :param context: The SDK ``OperationContext`` (unused here).
+                :param data: The SDK ``ToolCall`` about to execute.
+                :returns: A ``HookResult`` — ``allow=False`` blocks the call.
+                """
+                name = _tool_name(getattr(data, "name", None))
+                # Bridged Omnigent tools are TOOL_CALL-gated server-side on the
+                # dispatch path — don't evaluate them twice here.
+                if not name or name in executor._bridged_tool_names:
+                    return antigravity.types.HookResult(allow=True)
+                raw_args = getattr(data, "args", None)
+                args: ToolArgs = raw_args if isinstance(raw_args, dict) else {}
+                allow, reason = await executor._evaluate_tool_call_policy(name, args)
+                return antigravity.types.HookResult(allow=allow, message=reason)
+
+        return _OmnigentToolPolicyHook()
 
     def _build_post_tool_hook(
         self, antigravity: ModuleType, state: _AntigravitySessionState
@@ -882,6 +1105,24 @@ class AntigravityExecutor(Executor):
                 )
 
         return _OmnigentToolCompleteHook()
+
+    def _bridged_tool_name_set(self, tools: list[ToolSpec]) -> frozenset[str]:
+        """Return the names of the tools bridged through :attr:`_tool_executor`.
+
+        These are the Omnigent tools exposed as SDK callables for the turn —
+        exactly the names :meth:`_build_sdk_tools` would register. The pre-tool
+        decide hook uses this to skip them (they are TOOL_CALL-gated server-side
+        on the dispatch path). Returns an empty set when no executor bridge is
+        wired (the agent then runs native tools only, which the hook DOES gate).
+
+        :param tools: Omnigent tool specs for the turn.
+        :returns: The bridged tool names, or an empty set.
+        """
+        if not tools or self._tool_executor is None:
+            return frozenset()
+        return frozenset(
+            name for tool in tools if isinstance((name := tool.get("name")), str) and name
+        )
 
     def _build_sdk_tools(self, tools: list[ToolSpec]) -> list[SDKTool]:
         """Build SDK tools (plain callables) from Omnigent tool specs.

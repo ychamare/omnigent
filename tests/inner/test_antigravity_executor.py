@@ -4,10 +4,15 @@ Unit tests for :class:`omnigent.inner.antigravity_executor.AntigravityExecutor`.
 The fakes here mirror the real ``google.antigravity`` streaming surface the
 executor depends on: ``agent.conversation`` yields :class:`Step` objects from
 ``receive_steps()`` (text / reasoning deltas, tool calls, status, usage) as the
-turn runs, a registered ``PostToolCallHook`` fires per tool completion with a
+turn runs, a registered ``PreToolCallDecideHook`` gates each call before it
+runs, a registered ``PostToolCallHook`` fires per tool completion with a
 ``ToolResult``, and ``conversation.cancel()`` aborts a running turn. They let
-the streaming / tool-pairing / cancellation logic be tested without the SDK
-package or network.
+the streaming / tool-pairing / policy-gating / cancellation logic be tested
+without the SDK package or network.
+
+Policy tests additionally use a ``_FakePolicyEvaluator`` (scripted per-phase
+verdicts) and a ``_FakeElicitationHandler`` matching the async callables the
+harness ExecutorAdapter wires onto the executor in production.
 """
 
 from __future__ import annotations
@@ -98,6 +103,23 @@ class _FakeToolResult:
         self.exception = None
 
 
+class _FakeHookResult:
+    """Stand-in for ``google.antigravity.types.HookResult`` (allow/message)."""
+
+    def __init__(self, *, allow: bool = True, message: str = "") -> None:
+        self.allow = allow
+        self.message = message
+
+
+class _FakeSDKToolCall:
+    """Stand-in for ``google.antigravity.types.ToolCall`` (pre-tool hook data)."""
+
+    def __init__(self, name: str, args: dict[str, Any], call_id: str | None = None) -> None:
+        self.name = name
+        self.args = args
+        self.id = call_id
+
+
 class _FakeUsage:
     def __init__(self) -> None:
         self.prompt_token_count = 11
@@ -161,21 +183,58 @@ class _RaiseGeneric:
     message: str = "boom"
 
 
+@dataclass
+class _ExecToolCall:
+    """Turn-script action: run a tool through the SDK's pre-tool decide gate.
+
+    Mirrors the real ``_handle_tool_call`` flow: every registered
+    ``PreToolCallDecideHook`` is consulted with the ``ToolCall`` first; only if
+    they all allow does the tool "execute" and its ``PostToolCallHook`` fire.
+    Denied calls are recorded (and skip execution) so a test can prove the
+    policy gate blocked the tool BEFORE it ran.
+
+    :param call: The SDK ``ToolCall`` presented to the gate.
+    :param result: The ``ToolResult`` to surface via the post-tool hook when
+        the call is allowed.
+    """
+
+    call: _FakeSDKToolCall
+    result: _FakeToolResult
+
+
 # A turn script is the ordered list of actions one ``receive_steps()`` replays.
-_TurnAction = _YieldStep | _FireToolResult | _RaiseCancelled | _RaiseGeneric
+_TurnAction = _YieldStep | _FireToolResult | _ExecToolCall | _RaiseCancelled | _RaiseGeneric
 
 
 class _FakeConversation:
-    """Mirror of ``google.antigravity.conversation.Conversation`` (read paths)."""
+    """Mirror of ``google.antigravity.conversation.Conversation`` (read paths).
+
+    Splits the registered hooks by base class so the pre-tool decide hook
+    (consulted with a ``ToolCall``, returns a ``HookResult``) and the post-tool
+    hook (fired with a ``ToolResult``) are driven on their correct surfaces.
+    """
 
     def __init__(self, hooks: list[Any], scripts: collections.deque[list[_TurnAction]]) -> None:
-        self._hooks = hooks
+        self._pre_hooks = [h for h in hooks if isinstance(h, _FakePreToolCallDecideHook)]
+        self._post_hooks = [h for h in hooks if isinstance(h, _FakePostToolCallHook)]
         self._scripts = scripts
         self.sends: list[str] = []
         self.cancel_called = 0
+        # Tools the gate allowed to run / denied, by name — lets policy tests
+        # assert a denied tool never executed.
+        self.executed_tools: list[str] = []
+        self.denied_tools: list[str] = []
 
     async def send(self, prompt: Any, **_kwargs: Any) -> None:
         self.sends.append(prompt)
+
+    async def _gate_allows(self, call: _FakeSDKToolCall) -> bool:
+        """Run every pre-tool decide hook; deny if any returns ``allow=False``."""
+        for hook in self._pre_hooks:
+            res = await hook.run(SimpleNamespace(), call)
+            if not res.allow:
+                return False
+        return True
 
     async def receive_steps(self) -> Any:
         script = self._scripts.popleft() if self._scripts else []
@@ -183,8 +242,17 @@ class _FakeConversation:
             if isinstance(action, _YieldStep):
                 yield action.step
             elif isinstance(action, _FireToolResult):
-                for hook in self._hooks:
+                # Direct PostToolCallHook fire (call already past the gate).
+                for hook in self._post_hooks:
                     await hook.run(SimpleNamespace(), action.tool_result)
+            elif isinstance(action, _ExecToolCall):
+                # Full SDK flow: gate first, then execute + complete on allow.
+                if await self._gate_allows(action.call):
+                    self.executed_tools.append(action.call.name)
+                    for hook in self._post_hooks:
+                        await hook.run(SimpleNamespace(), action.result)
+                else:
+                    self.denied_tools.append(action.call.name)
             elif isinstance(action, _RaiseCancelled):
                 raise _AntigravityCancelledError("cancelled")
             elif isinstance(action, _RaiseGeneric):
@@ -243,6 +311,50 @@ class _FakePostToolCallHook:
         return None
 
 
+class _FakePreToolCallDecideHook:
+    """Sub-classable stand-in for ``hooks.PreToolCallDecideHook`` (returns HookResult)."""
+
+    async def run(self, context: Any, data: Any) -> Any:
+        return _FakeHookResult(allow=True)
+
+
+class _FakePolicyVerdict:
+    """Stand-in for the adapter's ``PolicyVerdictPayload`` (action + reason)."""
+
+    def __init__(self, action: str, reason: str | None = None) -> None:
+        self.action = action
+        self.reason = reason
+
+
+class _FakePolicyEvaluator:
+    """Scripted policy evaluator matching the executor's ``_policy_evaluator``.
+
+    Records every ``(phase, data)`` it is called with so tests can assert what
+    the executor evaluated, and returns a per-phase verdict (defaulting to
+    ALLOW for any phase without an explicit override).
+    """
+
+    def __init__(self, verdicts: dict[str, _FakePolicyVerdict] | None = None) -> None:
+        self._verdicts = verdicts or {}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def __call__(self, phase: str, data: dict[str, Any]) -> _FakePolicyVerdict:
+        self.calls.append((phase, data))
+        return self._verdicts.get(phase, _FakePolicyVerdict("POLICY_ACTION_ALLOW"))
+
+
+class _FakeElicitationHandler:
+    """Stand-in elicitation handler returning a fixed approve/deny decision."""
+
+    def __init__(self, approve: bool) -> None:
+        self._approve = approve
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def __call__(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+        self.calls.append((tool_name, tool_input))
+        return self._approve
+
+
 def _install_fake_sdk(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -261,9 +373,12 @@ def _install_fake_sdk(
 
     class _FakeHooks:
         PostToolCallHook = _FakePostToolCallHook
+        PreToolCallDecideHook = _FakePreToolCallDecideHook
 
     class _FakeTypes:
         AntigravityCancelledError = _AntigravityCancelledError
+        HookResult = _FakeHookResult
+        ToolCall = _FakeSDKToolCall
 
     class _FakeModule:
         LocalAgentConfig = _FakeLocalAgentConfig
@@ -1059,9 +1174,12 @@ def _install_blocking_sdk(
 
     class _FakeHooks:
         PostToolCallHook = _FakePostToolCallHook
+        PreToolCallDecideHook = _FakePreToolCallDecideHook
 
     class _FakeTypes:
         AntigravityCancelledError = _AntigravityCancelledError
+        HookResult = _FakeHookResult
+        ToolCall = _FakeSDKToolCall
 
     class _FakeModule:
         LocalAgentConfig = _FakeLocalAgentConfig
@@ -1134,3 +1252,243 @@ async def test_interrupt_session_unknown_returns_false(monkeypatch: pytest.Monke
     _install_fake_sdk(monkeypatch, scripts=[])
     executor = AntigravityExecutor()
     assert await executor.interrupt_session("never-started") is False
+
+
+# ── Policy enforcement tests (TOOL_CALL / LLM_REQUEST / LLM_RESPONSE) ────
+
+
+def _exec_tool(name: str, args: dict[str, Any], call_id: str = "t1") -> _ExecToolCall:
+    """Build an _ExecToolCall that gates ``name`` then completes it on allow."""
+    return _ExecToolCall(
+        call=_FakeSDKToolCall(name, args, call_id=call_id),
+        result=_FakeToolResult(name, result={"ok": True}, call_id=call_id),
+    )
+
+
+async def _async_ok() -> dict[str, Any]:
+    """Minimal bridged-tool executor result used by the skip test."""
+    return {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_tool_call_policy_deny_blocks_native_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A TOOL_CALL-phase DENY prevents a native tool from executing.
+
+    The pre-tool decide hook must consult the policy evaluator and return
+    ``allow=False`` so the SDK rejects the call BEFORE running it. Without the
+    hook (the bug) the tool would execute and the evaluator would never be
+    asked for PHASE_TOOL_CALL.
+    """
+    deny = _FakePolicyVerdict("POLICY_ACTION_DENY", reason="run_command blocked by operator")
+    evaluator = _FakePolicyEvaluator({"PHASE_TOOL_CALL": deny})
+    # ``run_command`` is a bundled NATIVE tool (not bridged), so it is not in
+    # the per-turn bridged set and the hook must gate it.
+    script: list[_TurnAction] = [
+        _exec_tool("run_command", {"command": "rm -rf /"}),
+        _text_step("done"),
+    ]
+    captured = _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    conversation = captured["agents"][0].conversation
+    # The gate denied the call: it was recorded as denied and NEVER executed.
+    assert conversation.denied_tools == ["run_command"]
+    assert conversation.executed_tools == []
+    # The evaluator was consulted for the TOOL_CALL phase with the call args.
+    tool_phase_calls = [d for (p, d) in evaluator.calls if p == "PHASE_TOOL_CALL"]
+    assert tool_phase_calls == [{"name": "run_command", "arguments": {"command": "rm -rf /"}}]
+
+
+@pytest.mark.asyncio
+async def test_tool_call_policy_allow_runs_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ALLOW verdict lets the native tool execute (gate is not over-broad)."""
+    evaluator = _FakePolicyEvaluator()  # defaults every phase to ALLOW
+    script: list[_TurnAction] = [_exec_tool("run_command", {"command": "ls"}), _text_step("done")]
+    captured = _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    conversation = captured["agents"][0].conversation
+    assert conversation.executed_tools == ["run_command"]
+    assert conversation.denied_tools == []
+
+
+@pytest.mark.asyncio
+async def test_tool_call_policy_skips_bridged_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bridged Omnigent tools are NOT re-evaluated here (gated server-side).
+
+    They route through the dispatch path which already enforces TOOL_CALL
+    policy; double-evaluating would double-count (and could double-charge a
+    cost budget). The hook must let them through without calling the evaluator.
+    """
+    # A DENY verdict would block the tool IF the hook evaluated it — proving the
+    # skip means asserting the tool still runs despite the deny.
+    deny = _FakePolicyVerdict("POLICY_ACTION_DENY", reason="should not be consulted")
+    evaluator = _FakePolicyEvaluator({"PHASE_TOOL_CALL": deny})
+    script: list[_TurnAction] = [_exec_tool("sys_shell", {"cmd": "ls"}), _text_step("done")]
+    captured = _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator
+    # Wire a tool executor + expose ``sys_shell`` so it is a BRIDGED tool.
+    executor._tool_executor = lambda name, args: _async_ok()
+    tool_specs = [{"name": "sys_shell", "description": "shell", "parameters": {}}]
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}], tool_specs)
+
+    conversation = captured["agents"][0].conversation
+    # Ran despite the DENY: the hook skipped the bridged tool entirely.
+    assert conversation.executed_tools == ["sys_shell"]
+    assert conversation.denied_tools == []
+    # The evaluator was never asked about the TOOL_CALL phase for this tool.
+    assert not any(p == "PHASE_TOOL_CALL" for (p, _d) in evaluator.calls)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_policy_ask_approved_runs_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A TOOL_CALL ASK routes through the elicitation handler; approve -> run."""
+    ask = _FakePolicyVerdict("POLICY_ACTION_ASK", reason="approve this command?")
+    evaluator = _FakePolicyEvaluator({"PHASE_TOOL_CALL": ask})
+    handler = _FakeElicitationHandler(approve=True)
+    script: list[_TurnAction] = [_exec_tool("run_command", {"command": "ls"}), _text_step("done")]
+    captured = _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator
+    executor._elicitation_handler = handler
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    conversation = captured["agents"][0].conversation
+    assert conversation.executed_tools == ["run_command"]
+    # The elicitation handler was consulted with the tool name + args.
+    assert handler.calls == [("run_command", {"command": "ls"})]
+
+
+@pytest.mark.asyncio
+async def test_tool_call_policy_ask_declined_blocks_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A TOOL_CALL ASK declined by the elicitation handler blocks the tool."""
+    ask = _FakePolicyVerdict("POLICY_ACTION_ASK")
+    evaluator = _FakePolicyEvaluator({"PHASE_TOOL_CALL": ask})
+    handler = _FakeElicitationHandler(approve=False)
+    script: list[_TurnAction] = [_exec_tool("run_command", {"command": "ls"}), _text_step("done")]
+    captured = _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator
+    executor._elicitation_handler = handler
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    conversation = captured["agents"][0].conversation
+    assert conversation.denied_tools == ["run_command"]
+    assert conversation.executed_tools == []
+
+
+@pytest.mark.asyncio
+async def test_tool_call_policy_ask_without_handler_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TOOL_CALL ASK with no elicitation handler denies (fail closed)."""
+    ask = _FakePolicyVerdict("POLICY_ACTION_ASK")
+    evaluator = _FakePolicyEvaluator({"PHASE_TOOL_CALL": ask})
+    script: list[_TurnAction] = [_exec_tool("run_command", {"command": "ls"}), _text_step("done")]
+    captured = _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator  # no _elicitation_handler wired
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    conversation = captured["agents"][0].conversation
+    assert conversation.denied_tools == ["run_command"]
+    assert conversation.executed_tools == []
+
+
+@pytest.mark.asyncio
+async def test_no_policy_evaluator_does_not_gate_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no policy evaluator wired, the pre-tool hook is a no-op (tool runs)."""
+    script: list[_TurnAction] = [_exec_tool("run_command", {"command": "ls"}), _text_step("done")]
+    captured = _install_fake_sdk(monkeypatch, scripts=[script])
+    executor = AntigravityExecutor()  # _policy_evaluator stays None
+
+    await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    conversation = captured["agents"][0].conversation
+    assert conversation.executed_tools == ["run_command"]
+    assert conversation.denied_tools == []
+
+
+@pytest.mark.asyncio
+async def test_llm_request_policy_deny_aborts_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An LLM_REQUEST DENY aborts the turn with ExecutorError and no model call.
+
+    The gate runs before the producer is spawned, so ``conversation.send`` is
+    never reached and no agent turn runs. Without the gate (the bug) the turn
+    would proceed and stream a reply.
+    """
+    deny = _FakePolicyVerdict("POLICY_ACTION_DENY", reason="prompt contains a banned phrase")
+    evaluator = _FakePolicyEvaluator({"PHASE_LLM_REQUEST": deny})
+    # A normal turn script — it must NOT run because the request is denied first.
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("should not stream")]])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator
+
+    events = await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "denied by policy" in errors[0].message
+    assert "prompt contains a banned phrase" in errors[0].message
+    # No model call: the producer never sent the prompt, and no reply streamed.
+    assert not any(isinstance(e, (TextChunk, TurnComplete)) for e in events)
+    # The agent was built lazily AFTER the request gate, so no agent exists.
+    assert captured["agents"] == []
+    # The evaluator saw the request phase; it never reached the response phase.
+    phases = [p for (p, _d) in evaluator.calls]
+    assert phases == ["PHASE_LLM_REQUEST"]
+
+
+@pytest.mark.asyncio
+async def test_llm_request_policy_allow_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ALLOW request verdict lets the turn run normally (gate not over-broad)."""
+    evaluator = _FakePolicyEvaluator()  # ALLOW for every phase
+    _install_fake_sdk(monkeypatch, scripts=[[_text_step("hello")]])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator
+
+    events = await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    assert [e.text for e in events if isinstance(e, TextChunk)] == ["hello"]
+    assert any(isinstance(e, TurnComplete) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_llm_response_policy_deny_blocks_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An LLM_RESPONSE DENY blocks the response: ExecutorError, no TurnComplete.
+
+    Evaluated after the stream completes but before TurnComplete, so the
+    generated text is never emitted as a completed turn. Without the gate the
+    turn would complete and the (policy-violating) response would be persisted.
+    """
+    deny = _FakePolicyVerdict("POLICY_ACTION_DENY", reason="response leaked a secret")
+    evaluator = _FakePolicyEvaluator({"PHASE_LLM_RESPONSE": deny})
+    _install_fake_sdk(monkeypatch, scripts=[[_text_step("the secret is hunter2")]])
+    executor = AntigravityExecutor()
+    executor._policy_evaluator = evaluator
+
+    events = await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "response denied by policy" in errors[0].message
+    assert "response leaked a secret" in errors[0].message
+    # The text streamed live (deltas can't be un-sent), but the turn must NOT
+    # complete — the DENY replaces TurnComplete with the ExecutorError.
+    assert not any(isinstance(e, TurnComplete) for e in events)
+    # Both phases were evaluated, response last, carrying the generated text.
+    phases = [p for (p, _d) in evaluator.calls]
+    assert phases == ["PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE"]
+    resp_data = next(d for (p, d) in evaluator.calls if p == "PHASE_LLM_RESPONSE")
+    assert resp_data["text_preview"] == "the secret is hunter2"
