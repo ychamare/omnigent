@@ -17,7 +17,7 @@ export const BRAIN_HARNESS_LABELS: Record<string, string> = {
   "claude-sdk": "Claude SDK",
   "openai-agents": "OpenAI Agents SDK",
   codex: "Codex",
-  "cursor": "Cursor",
+  cursor: "Cursor",
   pi: "Pi",
 };
 
