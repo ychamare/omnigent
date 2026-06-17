@@ -50,6 +50,7 @@ from omnigent.runner.app import (
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
+    _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
     _wake_post_is_retryable,
@@ -656,6 +657,143 @@ async def test_runner_session_tool_schemas_use_resolved_bundle_workdir(tmp_path:
     schemas = harness_client.posted_bodies[0].get("tools") or []
     assert any(s.get("function", {}).get("name") == "bundle_tool" for s in schemas), (
         f"expected bundled local tool schema, got {schemas}"
+    )
+
+
+def test_resolved_workdir_for_spec_prefers_bundle_workdir(tmp_path: Path) -> None:
+    """``_resolved_workdir_for_spec`` uses ``ResolvedSpec.workdir`` over fallback.
+
+    Bundle-deployed agents carry their own workdir (where
+    ``tools/python/*.py`` live). The dispatch path must thread that
+    workdir into ``dispatch_tool_locally`` so native python tools are
+    found at call time — not the generic ``runner_workspace``.
+    """
+    bundle_dir = tmp_path / "bundle"
+    runner_workspace = tmp_path / "workspace"
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+    entry = ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    assert _resolved_workdir_for_spec(entry, runner_workspace) == bundle_dir
+
+
+def test_resolved_workdir_for_spec_falls_back_without_bundle(tmp_path: Path) -> None:
+    """Non-bundle specs fall back to ``runner_workspace`` (prior behavior).
+
+    A bare ``AgentSpec`` (no ResolvedSpec wrapper) or a ``ResolvedSpec``
+    with ``workdir=None`` carries no bundle dir, so dispatch must keep
+    using the CLI launch workspace exactly as base did.
+    """
+    runner_workspace = tmp_path / "workspace"
+    bare_spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    # Unwrapped spec → no workdir → fallback.
+    assert _resolved_workdir_for_spec(bare_spec, runner_workspace) == runner_workspace
+    # ResolvedSpec with no workdir → fallback.
+    wrapped_no_workdir = ResolvedSpec(spec=bare_spec, workdir=None)
+    assert _resolved_workdir_for_spec(wrapped_no_workdir, runner_workspace) == runner_workspace
+    # Missing fallback stays None (don't fabricate a path).
+    assert _resolved_workdir_for_spec(bare_spec, None) is None
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle agent's native python tool dispatches against the bundle workdir.
+
+    End-to-end through ``POST /v1/sessions/{conv}/events`` (no live LLM):
+    the scripted harness emits an ``action_required`` for a spec-declared
+    python tool, and the runner must dispatch it locally with
+    ``runner_workspace`` set to the resolved ``ResolvedSpec.workdir`` (the
+    bundle dir), not the generic CLI ``runner_workspace``. This is the
+    dispatch-time counterpart to
+    :func:`test_runner_session_tool_schemas_use_resolved_bundle_workdir`,
+    which only proved schema generation used the bundle workdir.
+    """
+    import omnigent.runner.tool_dispatch as _tool_dispatch
+
+    bundle_dir = tmp_path / "bundle"
+    tool_dir = bundle_dir / "tools" / "python"
+    tool_dir.mkdir(parents=True)
+    (tool_dir / "bundle_tool.py").write_text(
+        "from omnigent_client.tools import tool\n\n"
+        "@tool\n"
+        "def bundle_tool(text: str) -> str:\n"
+        "    return text\n"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="bundle-agent",
+        local_tools=[
+            LocalToolInfo(
+                name="bundle_tool",
+                path="tools/python/bundle_tool.py",
+                language="python",
+            )
+        ],
+    )
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
+
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "bundle_tool",
+                    "call_id": "call_bundle",
+                    "arguments": json.dumps({"text": "from-bundle"}),
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_bundle/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_bundle",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(100):
+            if captured_workspaces:
+                break
+            await asyncio.sleep(0.05)
+
+    assert captured_workspaces, "native tool must be dispatched locally"
+    assert captured_workspaces[0] == bundle_dir, (
+        "dispatch must use the resolved bundle workdir, not runner_workspace "
+        f"({workspace!r}); got {captured_workspaces[0]!r}"
     )
 
 
