@@ -8,15 +8,14 @@ Minimize maintainer cost per issue. Let an AI bot handle the routine work (class
 
 ## Triage Pipeline
 
-Every issue flows through these stages. The AI bot handles Stage 1-3 autonomously; maintainers only engage at Stage 4.
+Every issue flows through these stages. The AI bot handles Stage 1-2 autonomously; maintainers only engage at Stage 3.
 
 ```mermaid
 flowchart LR
-    S1["**Stage 1**\nIntake\n(template)"]
-    S2["**Stage 2**\nAI Classify\n& Dedupe"]
-    S3["**Stage 3**\nAI Resolve\nor Route"]
-    S4["**Stage 4**\nMaintainer Queue\n(escalated only)"]
-    S1 --> S2 --> S3 --> S4
+    S1["**Stage 1**\nIntake"]
+    S2["**Stage 2**\nAI Triage"]
+    S3["**Stage 3**\nMaintainer Queue\n(escalated only)"]
+    S1 --> S2 --> S3
 ```
 
 ### Stage 1 — Lightweight Intake
@@ -36,9 +35,9 @@ Three templates, all minimal:
 Blank issues enabled — not everyone fits a template, and forcing people into one just creates bad data.
 
 
-### Stage 2 — AI Classify & Deduplicate
+### Stage 2 — AI Triage
 
-Triggered on every new issue. The bot reads the issue and applies labels — **labels only, no comments** (see [why not comments](#decision-labels-only-no-bot-comments)).
+Triggered on every new issue. The bot classifies, deduplicates, resolves what it can, and escalates the rest — **labels only, no comments** (see [why not comments](#decision-labels-only-no-bot-comments)).
 
 **What the bot does:**
 
@@ -56,9 +55,7 @@ Triggered on every new issue. The bot reads the issue and applies labels — **l
 
 **Tool:** `anthropics/claude-code-action` via GitHub Actions workflow, triggered `on: issues: [opened]`. Permissions: `issues: write` only.
 
-### Stage 3 — AI Resolve or Route
-
-Most issues never need a maintainer. The bot + lifecycle automation handles them:
+**Most issues never need a maintainer.** The bot + lifecycle automation resolves them:
 
 | Issue state | What happens | Human needed? |
 |---|---|---|
@@ -72,7 +69,7 @@ Most issues never need a maintainer. The bot + lifecycle automation handles them
 | **`P2-medium` bug** with repro | Stays open for contributor pickup or maintainer prioritization | **Maybe** |
 | **Bot uncertain** | Leaves `needs-triage`, doesn't apply priority | **Yes — escalated** |
 
-### Stage 4 — Maintainer Queue (Escalation)
+### Stage 3 — Maintainer Queue (Escalation)
 
 A maintainer only sees issues that the bot could not fully resolve. The escalation criteria:
 
