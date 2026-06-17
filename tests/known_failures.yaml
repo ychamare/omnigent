@@ -309,6 +309,12 @@ skips:
     cluster: files-uploads-attachments
     mode: skip
 
+  - id: tests/e2e/test_decorated_tools_e2e.py::test_decorated_tools_varied_signatures_e2e
+    reason: "openai-agents harness test hits platform.openai.com directly and 401s under the Databricks gateway profile (dapi PAT rejected as OpenAI key); needs gateway-routing/base_url fix before it can run in CI. Passes only with a real OPENAI_API_KEY locally."
+    issue: 532
+    cluster: run-ap-examples-harness
+    mode: skip
+
   - id: tests/e2e/test_policies_e2e.py::test_label_gate_untainted_conversation_passes
     reason: "Shard 1 bulk: label-gate untainted-pass; policy cluster."
     issue: 476
