@@ -4661,6 +4661,22 @@ def create_runner_app(
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
+        # A native agent terminal (Claude Code / pi) is long-lived: it stays
+        # up across turns and goes ``idle`` once a turn finishes. When its pane
+        # disappears while the session was last seen ``idle``, the work for the
+        # current turn was already delivered and the process simply exited —
+        # a clean shutdown, not a failure. Flipping the chat to ``failed`` here
+        # was the source of spurious "failed" sessions in the UI (the terminal
+        # exited, but nothing actually failed). Only the resource is gone; the
+        # runner going offline is surfaced via the normal liveness path
+        # (``runner_online: false`` → reconnect hint), so we release the
+        # harness subprocess and stop. A mid-turn exit (``session_was_idle`` is
+        # False because the last edge was ``running``) and a boot failure (no
+        # status ever observed) both still fall through to ``failed``.
+        if event.session_was_idle:
+            _release_failed_required_terminal_session(event.session_id)
+            return
+
         output = _format_required_terminal_exit_output(event)
         _publish_event(
             event.session_id,
