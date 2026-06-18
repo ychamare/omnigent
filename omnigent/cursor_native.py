@@ -93,7 +93,12 @@ class PreparedCursorTerminal:
         Cursor records no resumable chat id, so this is genuinely a new
         chat - distinct from a brand-new session (``resolved_session_id
         is None``) and from a live reattach. Drives the honest
-        cold-resume stderr hint.
+        cold-resume stderr hint. Note: cursor deliberately treats
+        ``cold_resumed`` and ``reattached`` as mutually exclusive (the
+        cold-resume path leaves ``reattached`` at its ``False`` default)
+        - unlike ``claude_native`` which models them independently. This
+        is safe because cursor never reads ``reattached`` for teardown
+        ownership; do not "fix" the apparent inconsistency.
     """
 
     session_id: str
@@ -361,6 +366,10 @@ async def _prepare_cursor_terminal_via_daemon(
             # Session exists but its terminal has exited. Cursor records no
             # resumable chat id, so the launch below starts a fresh TUI with
             # no prior turns. Flag it so the caller can say so honestly.
+            # Mutually exclusive with the reattach path above: we leave
+            # reattached at False here (unlike claude_native, which treats
+            # cold_resumed/reattached as independent). Safe because cursor
+            # never uses reattached for teardown ownership.
             cold_resumed = True
             if persist_args:
                 _update_startup_progress(startup_progress, "Updating Cursor session...")
