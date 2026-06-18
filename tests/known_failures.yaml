@@ -368,12 +368,6 @@ skips:
     cluster: async-dispatch-inbox-sse
     mode: skip
 
-  - id: tests/e2e/test_web_search_async_dispatch_e2e.py::test_web_search_async_dispatch_completes_on_non_openai_model
-    reason: "Nightly bulk: web-search async dispatch (409 conflict)."
-    issue: 532
-    cluster: async-dispatch-inbox-sse
-    mode: skip
-
   # ── Bulk-quarantine round 3 (2026-05-18, run 26017551154) ──
   # 20 tests across all 4 shards. Agent setup migrated from
   # POST /api/agents to multipart POST /v1/sessions in #1559.
