@@ -592,9 +592,15 @@ def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
     """
     Return a copy of ``args`` with sensitive flag values redacted for logging.
 
-    The value following any flag in :data:`_REDACTED_ARGV_FLAGS` (e.g. the full
-    system prompt passed via ``--append-system-prompt``) is replaced with a
-    ``[system prompt N chars]`` placeholder so it never leaks into debug logs.
+    The system prompt value (e.g. passed via ``--append-system-prompt``) is
+    replaced with a ``[system prompt N chars]`` placeholder so it never leaks
+    into debug logs. Two argv forms are handled:
+
+    * the two-token form ``--append-system-prompt <value>`` (what the current
+      spawn code emits), and
+    * the equals-joined form ``--append-system-prompt=<value>`` (not emitted
+      today, but redacted defensively in case a future refactor switches to it).
+
     All other tokens are preserved so the command remains useful for debugging.
     """
     redacted: list[str] = []
@@ -604,9 +610,17 @@ def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
             redacted.append(f"[system prompt {len(arg)} chars]")
             redact_next = False
             continue
-        redacted.append(arg)
         if arg in _REDACTED_ARGV_FLAGS:
+            # Two-token form: redact the following value token.
+            redacted.append(arg)
             redact_next = True
+            continue
+        flag, sep, value = arg.partition("=")
+        if sep and flag in _REDACTED_ARGV_FLAGS:
+            # Equals-joined form: redact the inline value, keep the flag name.
+            redacted.append(f"{flag}=[system prompt {len(value)} chars]")
+            continue
+        redacted.append(arg)
     return redacted
 
 

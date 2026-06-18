@@ -2692,6 +2692,41 @@ def test_redact_argv_for_log_hides_system_prompt() -> None:
     assert "/tmp/ext.js" in redacted
 
 
+def test_redact_argv_for_log_hides_two_token_system_prompt_flag() -> None:
+    """The two-token ``--system-prompt <value>`` form is redacted too, not just
+    ``--append-system-prompt``."""
+    secret = "REPLACEMENT SYSTEM PROMPT that must never hit the logs"
+    args = ["/fake/pi", "--system-prompt", secret, "--mode", "rpc"]
+
+    redacted = _redact_argv_for_log(args)
+
+    assert secret not in " ".join(redacted)
+    assert f"[system prompt {len(secret)} chars]" in redacted
+    assert "--system-prompt" in redacted
+    assert "--mode" in redacted
+    assert "rpc" in redacted
+
+
+def test_redact_argv_for_log_hides_equals_joined_system_prompt() -> None:
+    """``_redact_argv_for_log`` redacts the equals-joined
+    ``--append-system-prompt=<value>`` / ``--system-prompt=<value>`` forms while
+    keeping the flag name visible."""
+    secret = "SUPER SECRET SYSTEM PROMPT that must never hit the logs"
+    for flag in ("--append-system-prompt", "--system-prompt"):
+        args = ["/fake/pi", "--mode", "rpc", f"{flag}={secret}", "--extension", "/tmp/ext.js"]
+
+        redacted = _redact_argv_for_log(args)
+
+        rendered = " ".join(redacted)
+        assert secret not in rendered
+        assert f"{flag}=[system prompt {len(secret)} chars]" in redacted
+        # Flag name and other tokens stay visible for debugging.
+        assert "--mode" in redacted
+        assert "rpc" in redacted
+        assert "--extension" in redacted
+        assert "/tmp/ext.js" in redacted
+
+
 def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
     """``_PiRpcSession.start`` must not write the full ``--append-system-prompt``
     value to the debug log; it should be redacted to a length placeholder.
