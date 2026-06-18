@@ -260,12 +260,6 @@ skips:
     cluster: subagent-supervisor-routing
     mode: skip
 
-  - id: tests/e2e/test_sys_terminal_e2e.py::test_sys_terminal_ten_parallel_dispatches_complete_e2e
-    reason: "Shard 3 bulk: sys-terminal 10-parallel-dispatch. Same family."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
   - id: tests/e2e/omnigent/test_run_omnigent_example_agents.py::test_run_omnigent_example_yaml[coding_supervisor_with_forks]
     reason: "Shard 3 bulk: run_omnigent example-yaml coding_supervisor_with_forks."
     issue: 532
@@ -289,12 +283,6 @@ skips:
     issue: 532
     cluster: repl-pexpect-cli
     mode: skip
-  - id: tests/e2e/test_d6_parallel_fan_out_e2e.py::test_async_client_tools_fan_out_in_parallel
-    reason: "Shard 3 bulk: D6 parallel client-tool fan-out. Same D6 server-side terminal-event family."
-    issue: 532
-    cluster: terminal-d6
-    mode: skip
-
   - id: tests/e2e/test_sys_async_inbox_e2e.py::test_sys_read_inbox_str_branch_routes_without_crash_e2e
     reason: "Shard 3 bulk: sys async-inbox str-branch routing."
     issue: 532
