@@ -361,12 +361,16 @@ def test_policy_denies_tool_call_by_name(
     """
     _check_harness_available(harness)
     yaml_path = tool_ban_yaml_factory(harness, model)
-    # A math question the LLM would normally answer by calling
-    # ``calculate`` and echoing "12". Under the policy, the
-    # calculate call is intercepted and the sentinel is returned
-    # as tool output instead — so the LLM's final reply reflects
-    # the denial, never "12".
-    prompt = "What is 6 + 6?"
+    # A math question the LLM cannot evaluate in-head, so it
+    # reliably routes through the ``calculate`` tool. A trivial
+    # expression like "6 + 6" let the model answer inline without
+    # ever emitting a tool call — the deny policy then had nothing
+    # to intercept and the test flaked on model nondeterminism. A
+    # large product forces the tool call. Under the policy the
+    # calculate call is intercepted and the sentinel is returned as
+    # tool output instead, so the LLM's final reply reflects the
+    # denial, never the real product 443242686.
+    prompt = "What is 48273 multiplied by 9182? Use the calculate tool."
     result = subprocess.run(
         [
             str(omnigent_python),
@@ -404,13 +408,14 @@ def test_policy_denies_tool_call_by_name(
         f"result.\nstdout tail:\n{result.stdout[-2500:]}"
     )
 
-    # The answer "12" must NOT appear — its presence would mean
-    # the calculate tool actually ran. The DENY path must short-
-    # circuit dispatch. Using " 12" with a leading space to avoid
-    # false positives (e.g. policy reason containing a digit).
-    assert " 12" not in result.stdout, (
-        f"The answer '12' leaked into the output — the calculate "
-        f"tool ran despite the DENY policy. Enforcement is "
+    # The real product (443242686) must NOT appear — its presence
+    # would mean the calculate tool actually ran. The DENY path
+    # must short-circuit dispatch. The model cannot produce this
+    # value without the tool, so any leak is unambiguous. Strip
+    # commas first so a "443,242,686"-formatted leak still trips.
+    assert "443242686" not in result.stdout.replace(",", ""), (
+        f"The real product '443242686' leaked into the output — the "
+        f"calculate tool ran despite the DENY policy. Enforcement is "
         f"bypassing dispatch incorrectly.\n"
         f"stdout tail:\n{result.stdout[-2500:]}"
     )
@@ -435,8 +440,7 @@ def subagent_ban_yaml_factory(tmp_path: Path) -> Callable[[str, str], Path]:
     :class:`AgentTool`) and a policy that narrows to the
     sub-agent's *declared name* via ``match_tools: [worker]``.
 
-    Exercises the Gap 8 fix in
-    :func:`omnigent.runtime.executors.omnigent._make_tool_executor_bridge`:
+    Exercises the Gap 8 fix in the tool-executor bridge:
     when the LLM calls ``worker(input=...)`` directly (rather
     than ``sys_session_send(type="worker", ...)``), the bridge
     routes the call through ``_dispatch_user_agent_tool`` and
