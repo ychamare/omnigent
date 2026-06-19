@@ -64,8 +64,14 @@ def test_coding_supervisor_with_forks_one_shot(
         response queues.
     :param harness: The harness identifier from
         :data:`HARNESS_HARNESS_MODELS`.
-    :param model: The harness-routed model identifier.
+    :param model: Unused — replaced by a per-harness mock key below.
+        The real model from :data:`HARNESS_HARNESS_MODELS` would put
+        the ``pi`` harness into gateway mode (pi inspects the
+        ``databricks-*`` model name and switches to real-gateway auth,
+        ignoring the mock's ``OPENAI_BASE_URL``); a ``mock-*`` key keeps
+        every harness routed through the mock LLM server.
     """
+    del model  # replaced by mock_model below
     if harness == "claude-sdk":
         require_claude_sdk()
         if which("claude") is None:
@@ -73,20 +79,16 @@ def test_coding_supervisor_with_forks_one_shot(
                 "claude-sdk harness prerequisite missing: the 'claude' "
                 "CLI binary must be installed on PATH."
             )
-        # Use a non-gateway model so ClaudeSDKExecutor routes through
-        # ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY (no ~/.databrickscfg needed).
-        # Databricks-prefixed models set gateway=True which reads the cfg file.
-        if model.startswith("databricks-"):
-            model = "claude-mock"
     elif harness == "codex":
         require_codex_cli()
-        # Use a non-gateway model for the same reason as claude-sdk above.
-        if model.startswith("databricks-"):
-            model = "gpt-mock"
     elif harness == "pi":
         if which("pi") is None:
             pytest.skip("pi harness prerequisite missing: 'pi' CLI not on PATH.")
 
+    # Per-harness mock key so concurrent harness rows get isolated mock
+    # response queues, and so ``pi`` stays in mock mode rather than
+    # gateway-routing a ``databricks-*`` model name.
+    mock_model = f"mock-coding-supervisor-{harness}"
     # Pre-seed the mock queue with enough canned replies to cover the
     # supervisor turn plus both worker sub-agent turns and any auto-wake.
     reset_mock_llm(mock_llm_server_url)
@@ -98,22 +100,14 @@ def test_coding_supervisor_with_forks_one_shot(
             {"text": "Worker B finished."},
             {"text": "Both workers done. Summary: OK."},
         ],
-        key=model,
+        key=mock_model,
     )
-    # claude-sdk routes through ANTHROPIC_BASE_URL; add it alongside the
-    # OPENAI_BASE_URL already in mock_credentials_env so both harnesses
-    # reach the mock server.
-    env = dict(mock_credentials_env)
-    if harness == "claude-sdk":
-        env["ANTHROPIC_BASE_URL"] = mock_llm_server_url
-        env["ANTHROPIC_API_KEY"] = "mock-key"
-        env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] = "printf %s mock-key"
     result = run_one_shot(
         omnigent_python=omnigent_python,
         omnigent_repo_root=omnigent_repo_root,
-        omnigent_credentials_env=env,
+        omnigent_credentials_env=mock_credentials_env,
         example_name="coding_supervisor_with_forks",
         harness=harness,
-        model=model,
+        model=mock_model,
     )
     assert_completed_one_shot(result, "coding_supervisor_with_forks")
