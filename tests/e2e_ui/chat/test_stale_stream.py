@@ -8,8 +8,8 @@ shimmer for an "Agent is unresponsive" banner.
 
 This test exercises the full chain: SPA → SSE stream → health poll →
 banner render. It kills the runner subprocess with SIGKILL while the
-LLM is processing, so the tunnel drops instantly — no graceful
-shutdown, no terminal SSE event.
+mock LLM is blocking (``block: true``), so the tunnel drops instantly
+— no graceful shutdown, no terminal SSE event.
 """
 
 from __future__ import annotations
@@ -19,9 +19,12 @@ import re
 import signal
 import subprocess
 import time
+from typing import Any
 
 import httpx
 from playwright.sync_api import Page, expect
+
+from tests.e2e.conftest import configure_mock_llm
 
 
 def _find_runner_pids() -> list[int]:
@@ -48,11 +51,12 @@ def _find_runner_pids() -> list[int]:
 def test_stale_banner_on_runner_crash(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Open a pre-created session, send a message, kill the runner while
-    the LLM is thinking, and assert the "unresponsive" banner replaces
-    "Working…".
+    the mock LLM is blocking, and assert the "unresponsive" banner
+    replaces "Working…".
 
     Starts from ``/c/<id>`` instead of ``/`` because the home route no
     longer renders a composer — see :func:`seeded_session`.
@@ -60,7 +64,13 @@ def test_stale_banner_on_runner_crash(
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` of a pre-created
         session bound to the running runner.
+    :param mock_llm_server_url: Base URL of the mock LLM server.
     """
+    # Block indefinitely so the runner is still waiting on the LLM when
+    # we SIGKILL it — the tunnel drops instantly and the health endpoint
+    # flips to runner_online=false without any graceful teardown.
+    configure_mock_llm(mock_llm_server_url, [{"block": True, "text": ""}])
+
     live_server, session_id = seeded_session
     page.goto(f"{live_server}/c/{session_id}")
 
@@ -102,7 +112,7 @@ def test_stale_banner_on_runner_crash(
     # Poll until the health endpoint reports offline (tunnel teardown
     # is async — the server's WS route needs to notice the close and
     # deregister). 10 retries × 0.5 s = 5 s budget.
-    health_after: dict[str, object] = {}
+    health_after: dict[str, Any] = {}
     for _attempt in range(10):
         time.sleep(0.5)
         health_after = httpx.get(

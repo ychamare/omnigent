@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e.conftest import configure_mock_llm
 
 _COMPOSER = "Ask the agent anything…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
@@ -19,15 +20,18 @@ _USER = '[data-testid="message-bubble"][data-role="user"]'
 _WORKING = '[data-testid="working-indicator"]'
 
 
-# Back on nightly burn-in: flaked on its first PR-gate run (turn-2
-# reply paraphrased instead of echoing the token verbatim).
-@pytest.mark.nightly
 def test_reload_hydrates_history_and_continues(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     base_url, session_id = seeded_session
     token = f"ui-reload-{uuid.uuid4().hex[:8]}"
+
+    # Turn 1 returns "stored"; turn 2 returns the token verbatim so the
+    # post-reload continuation can only succeed if context was preserved.
+    configure_mock_llm(mock_llm_server_url, [{"text": "stored"}, {"text": token}])
+
     page.goto(f"{base_url}/c/{session_id}")
 
     composer = page.get_by_placeholder(_COMPOSER)
@@ -37,8 +41,8 @@ def test_reload_hydrates_history_and_continues(
         f"verbatim later: {token}. Reply with just the word 'stored'."
     )
     page.get_by_role("button", name="Send", exact=True).click()
-    expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=60_000)
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+    expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=10_000)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=10_000)
 
     page.reload()
 
@@ -55,8 +59,8 @@ def test_reload_hydrates_history_and_continues(
     # bubble; asserting the count first keeps the `.last` content check
     # from matching a turn-1 echo of the token.
     expect(page.locator(_USER)).to_have_count(2, timeout=15_000)
-    expect(page.locator(_ASSISTANT).nth(1)).to_be_visible(timeout=60_000)
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+    expect(page.locator(_ASSISTANT).nth(1)).to_be_visible(timeout=10_000)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=10_000)
     # Post-reload context retention: only server-side history can
     # supply the token after the in-memory state was destroyed.
     expect(page.locator(_ASSISTANT, has_text=token).last).to_be_visible(timeout=15_000)

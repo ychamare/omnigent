@@ -42,6 +42,8 @@ import re
 
 from playwright.sync_api import Page, expect
 
+from tests.e2e.conftest import configure_mock_llm
+
 # Unique sentinels per test so a user bubble is unambiguously locatable
 # and can't collide with the assistant's reply text. Worded so the model
 # has no reason to echo them verbatim into its own bubble.
@@ -75,6 +77,7 @@ def _send(page: Page, text: str) -> None:
 def test_optimistic_user_bubble_renders_then_persists_through_consume(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """Send a message: it renders immediately and stays through the turn.
 
@@ -90,6 +93,8 @@ def test_optimistic_user_bubble_renders_then_persists_through_consume(
        block without clearing the optimistic one (double-render — the
        exact symptom this change targets).
     """
+    configure_mock_llm(mock_llm_server_url, [{"text": "pong"}])
+
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -102,7 +107,7 @@ def test_optimistic_user_bubble_renders_then_persists_through_consume(
     # with non-whitespace text (not the "Working…" shimmer, which has a
     # different testid). This guarantees the consume + promote happened.
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
+    expect(assistant).to_have_text(re.compile(r"\S"), timeout=10_000)
 
     # (2) Exactly one user bubble survived the promote — not dropped, not
     # duplicated.
@@ -112,6 +117,7 @@ def test_optimistic_user_bubble_renders_then_persists_through_consume(
 def test_user_message_survives_navigation_away_and_back(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """Send a message, navigate away and back: the bubble re-renders.
 
@@ -128,6 +134,8 @@ def test_user_message_survives_navigation_away_and_back(
     ``bindStream`` hydration path against a regression that drops
     re-rendered user bubbles.
     """
+    configure_mock_llm(mock_llm_server_url, [{"text": "pong"}])
+
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -137,7 +145,7 @@ def test_user_message_survives_navigation_away_and_back(
     # Let the turn finish so the message is committed server-side before
     # we navigate (the durable state we expect to re-hydrate).
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
+    expect(assistant).to_have_text(re.compile(r"\S"), timeout=10_000)
 
     # Navigate away to the landing route, then back into the chat.
     page.goto(f"{base_url}/")
@@ -152,6 +160,7 @@ def test_user_message_survives_navigation_away_and_back(
 def test_second_message_queued_while_first_streams_both_render(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """Queue a second message while the first turn is active: both render.
 
@@ -166,6 +175,8 @@ def test_second_message_queued_while_first_streams_both_render(
     other than 1 for either means the FIFO promotion dropped or
     duplicated a queued bubble.
     """
+    configure_mock_llm(mock_llm_server_url, [{"text": "pong"}, {"text": "pong"}])
+
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -180,6 +191,6 @@ def test_second_message_queued_while_first_streams_both_render(
     # the session goes idle there must be exactly one bubble for each —
     # both consumed and promoted, neither dropped nor double-rendered.
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
-    expect(_user_bubble(page, _QUEUE_MSG_A)).to_have_count(1, timeout=60_000)
-    expect(_user_bubble(page, _QUEUE_MSG_B)).to_have_count(1, timeout=60_000)
+    expect(assistant).to_have_text(re.compile(r"\S"), timeout=10_000)
+    expect(_user_bubble(page, _QUEUE_MSG_A)).to_have_count(1, timeout=10_000)
+    expect(_user_bubble(page, _QUEUE_MSG_B)).to_have_count(1, timeout=10_000)

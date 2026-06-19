@@ -22,10 +22,13 @@ import re
 
 from playwright.sync_api import Page, expect
 
+from tests.e2e.conftest import configure_mock_llm
+
 
 def test_send_message_renders_assistant_response(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Open a pre-created session, type a prompt, click Send, and assert
@@ -38,8 +41,7 @@ def test_send_message_renders_assistant_response(
     - The composer is mis-wired (``ChatPage.tsx`` regression).
     - The agent never received the request (server / runtime
       regression — check the live_server log).
-    - The LLM never responded (Databricks credentials missing or
-      hello_world model unavailable).
+    - The mock LLM server is misconfigured or unreachable.
     - The SDK reducer didn't render output (TS reducer parity drift
       vs ``omnigent_client/_stream.py`` — see
       ``ap-web/README.md`` § Reducer parity).
@@ -51,7 +53,10 @@ def test_send_message_renders_assistant_response(
         browser context per test).
     :param seeded_session: ``(base_url, session_id)`` from the
         pre-created session fixture.
+    :param mock_llm_server_url: Base URL of the mock LLM server.
     """
+    configure_mock_llm(mock_llm_server_url, [{"text": "pong"}])
+
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -64,12 +69,12 @@ def test_send_message_renders_assistant_response(
     expect(page).to_have_url(re.compile(rf"/c/{re.escape(session_id)}"))
 
     # Wait for a real assistant bubble (NOT the "Working…" shimmer
-    # — that has data-testid="working-indicator" instead). 60s budget
-    # covers cold-start LLM latency under Databricks routing without
-    # masking a true hang. ``re.compile(r"\S")`` matches any non-
-    # whitespace character — a rendered bubble whose MessageContent
-    # is empty would mean the streaming reducer fired but produced
-    # no text, itself a regression worth surfacing.
+    # — that has data-testid="working-indicator" instead). 10s budget
+    # is sufficient when backed by the mock LLM (no real inference
+    # latency). ``re.compile(r"\S")`` matches any non-whitespace
+    # character — a rendered bubble whose MessageContent is empty would
+    # mean the streaming reducer fired but produced no text, itself a
+    # regression worth surfacing.
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
-    expect(assistant).to_be_visible(timeout=60_000)
-    expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
+    expect(assistant).to_be_visible(timeout=10_000)
+    expect(assistant).to_have_text(re.compile(r"\S"), timeout=10_000)
