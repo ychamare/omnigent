@@ -22,6 +22,13 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from tests.e2e._harness_probes import (
+    HARNESS_HARNESS_MODELS,
+    HARNESS_IDS,
+    skip_if_harness_cli_missing,
+)
 from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 from tests.e2e.omnigent._snapshot import compare_snapshot
 
@@ -32,28 +39,71 @@ _DENIED_MARKER = "[Denied by policy: Canada-related topics are denied"
 _RUN_TIMEOUT_SEC = 60
 
 
+def _build_harness_env(
+    harness: str,
+    base_env: dict[str, str],
+    mock_url: str,
+) -> dict[str, str]:
+    """
+    Overlay harness-specific mock-server routing onto ``base_env``.
+
+    ``base_env`` (from :func:`mock_credentials_env`) already has
+    ``OPENAI_BASE_URL`` pointed at ``<mock_url>/v1`` and
+    ``OPENAI_API_KEY=mock-key``, which is correct for the
+    openai-agents, codex, and pi harnesses.  claude-sdk speaks the
+    Anthropic Messages API instead, so we swap in
+    ``ANTHROPIC_BASE_URL`` (the SDK appends ``/v1/messages``) and
+    set the API-key helper so the CLI resolves a bearer token
+    without hitting a real Anthropic endpoint.
+
+    :param harness: Harness identifier, e.g. ``"claude-sdk"``.
+    :param base_env: Env dict from :func:`mock_credentials_env`.
+    :param mock_url: Base URL of the session-scoped mock server,
+        e.g. ``"http://127.0.0.1:12345"``.
+    :returns: A shallow copy of ``base_env`` with the per-harness
+        overrides applied.
+    """
+    env = dict(base_env)
+    if harness == "claude-sdk":
+        env["ANTHROPIC_BASE_URL"] = mock_url
+        env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] = "printf %s mock-key"
+        env.pop("OPENAI_BASE_URL", None)
+        env.pop("OPENAI_API_KEY", None)
+    return env
+
+
+@pytest.mark.parametrize("harness,model", HARNESS_HARNESS_MODELS, ids=HARNESS_IDS)
 def test_yaml_policies_blocks_canada_input(
     omnigent_python: Path,
     omnigent_repo_root: Path,
     mock_credentials_env: dict[str, str],
     mock_llm_server_url: str,
+    harness: str,
+    model: str,
 ) -> None:
     """
-    ``omnigent run agent_with_policies.yaml --harness openai-agents
+    ``omnigent run agent_with_policies.yaml --harness <harness>
     -p "Name the provinces of Canada."`` exits 0 and stdout
     contains the denial marker.
+
+    Parametrized across every wrapped harness so the policy engine
+    is verified end-to-end once per harness.
 
     The mock LLM is configured to return a DENY verdict for the
     policy judge model. The base model queue is also configured
     but should never be consumed.
+
+    :param harness: The harness identifier from
+        :data:`HARNESS_HARNESS_MODELS`.
+    :param model: Unused in mock mode — replaced by a per-harness
+        mock key so each row gets an isolated response queue.
     """
-    base_model = "mock-policy-base"
+    del model  # replaced by base_model below
+    skip_if_harness_cli_missing(harness)
+
+    base_model = f"mock-policy-base-{harness}"
     reset_mock_llm(mock_llm_server_url)
 
-    # Read the policy YAML to find the policy judge's model name.
-    # The ``block_canada_input`` policy uses the model from the
-    # policy's ``executor.model`` field. We need to configure the
-    # mock for that model key.
     yaml_path = (
         omnigent_repo_root / "tests" / "resources" / "examples" / "agent_with_policies.yaml"
     )
@@ -78,6 +128,8 @@ def test_yaml_policies_blocks_canada_input(
         key=base_model,
     )
 
+    env = _build_harness_env(harness, mock_credentials_env, mock_llm_server_url)
+
     result = subprocess.run(
         [
             str(omnigent_python),
@@ -86,7 +138,7 @@ def test_yaml_policies_blocks_canada_input(
             "run",
             str(yaml_path),
             "--harness",
-            "openai-agents",
+            harness,
             "--model",
             base_model,
             "-p",
@@ -94,7 +146,7 @@ def test_yaml_policies_blocks_canada_input(
             "--no-log",
             "--no-session",
         ],
-        env=mock_credentials_env,
+        env=env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,
