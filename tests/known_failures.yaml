@@ -33,4 +33,3 @@ skips:
     issue: 523
     cluster: mock-claude-sdk-cli-unsupported
     mode: skip
-
