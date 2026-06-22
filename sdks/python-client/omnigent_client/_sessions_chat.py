@@ -1131,8 +1131,14 @@ class SessionsChat:
                 elif isinstance(event, SessionStatusEvent):
                     if event.status == "waiting":
                         # Agent parked on inbox drain — sub-agents dispatched.
+                        # Break immediately: the flag is set and there is no
+                        # reason to stay subscribed. Exiting via break (not
+                        # timeout) closes the async generator cleanly and
+                        # avoids the "aclose(): already running" asyncio error
+                        # that occurs when asyncio.timeout fires mid-stream.
                         self._last_turn_saw_waiting = True
-                    elif event.status == "running":
+                        break
+                    if event.status == "running":
                         # New turn started (e.g. inbox auto-wake for synthesis).
                         # Reset: the dispatch wait is over; if the synthesis
                         # itself dispatches, it will set the flag again.
