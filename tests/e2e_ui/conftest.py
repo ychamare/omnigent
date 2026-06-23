@@ -2222,17 +2222,17 @@ def native_claude_mock_session(
         ctx = contextlib.nullcontext()
     with ctx:
         session_id = _create_native_claude_session(live_server, runner_id)
-    try:
-        yield (live_server, session_id)
-    finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned.kill()
-                respawned.wait(timeout=5)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
 
 
 @pytest.fixture
@@ -2260,16 +2260,16 @@ def native_codex_mock_session(
         ctx = contextlib.nullcontext()
     with ctx:
         session_id = _create_native_codex_session(live_server, runner_id)
-    try:
-        yield (live_server, session_id)
-    finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned.kill()
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
                 respawned.wait(timeout=5)
 
 
