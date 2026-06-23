@@ -47,7 +47,6 @@ _AGENT_NAME = "opencode"
 # shared with the codex-native forwarder).
 _EXTERNAL_ITEM = "external_conversation_item"
 _EXTERNAL_STATUS = "external_session_status"
-_EXTERNAL_TEXT_DELTA = "external_output_text_delta"
 
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
@@ -67,12 +66,10 @@ class OpenCodeForwarderState:
 
     :param seen: Bounded set of dedupe keys already posted.
     :param turn_active: Whether a turn is currently streaming.
-    :param text_index: Per-text-stream chunk index for delta ordering.
     """
 
     seen: OrderedDict[str, None] = field(default_factory=OrderedDict)
     turn_active: bool = False
-    text_index: dict[str, int] = field(default_factory=dict)
 
     def mark(self, key: str) -> bool:
         """
@@ -87,17 +84,6 @@ class OpenCodeForwarderState:
         while len(self.seen) > _MAX_DEDUPE_KEYS:
             self.seen.popitem(last=False)
         return True
-
-    def next_text_index(self, stream_id: str) -> int:
-        """
-        Return the next zero-based chunk index for a text stream.
-
-        :param stream_id: Stable text-stream id.
-        :returns: Monotonic chunk index.
-        """
-        index = self.text_index.get(stream_id, 0)
-        self.text_index[stream_id] = index + 1
-        return index
 
 
 class OpenCodeNativeForwarder:
@@ -323,17 +309,6 @@ class OpenCodeNativeForwarder:
             },
         )
 
-    async def _post_text_delta(self, stream_id: str, delta: str) -> None:
-        """Publish a streaming assistant text delta."""
-        await self._post_event(
-            _EXTERNAL_TEXT_DELTA,
-            {
-                "delta": delta,
-                "message_id": stream_id,
-                "index": self.state.next_text_index(stream_id),
-            },
-        )
-
     async def _post_tool_call(self, call_id: str, tool: str, arguments: dict[str, Any]) -> None:
         """Mirror a tool invocation as a function_call item."""
         await self._post_event(
@@ -465,22 +440,6 @@ class OpenCodeNativeForwarder:
             error = state.get("error")
             await self._post_tool_output(call_id, f"[error] {error}" if error else "[error]")
 
-    async def _on_part_delta(self, event: OpenCodeEvent) -> None:
-        """Handle ``message.part.delta`` — stream assistant text live.
-
-        Deltas are ephemeral (the server publishes them without persisting);
-        the durable chat item is the finalized text posted by
-        :meth:`_flush_pending_text`.
-        """
-        if event.properties.get("field") != "text":
-            return
-        delta = event.properties.get("delta")
-        part_id = event.properties.get("partID")
-        if not isinstance(delta, str) or not delta or not isinstance(part_id, str):
-            return
-        await self._begin_turn_if_needed()
-        await self._post_text_delta(self._key("text", part_id), delta)
-
     async def _on_session_status(self, event: OpenCodeEvent) -> None:
         """Handle ``session.status`` — surface the running edge."""
         status = event.properties.get("status")
@@ -587,7 +546,13 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     # on the message + session. (Verified against a real ``opencode serve``.)
     "message.updated": OpenCodeNativeForwarder._on_message_updated,
     "message.part.updated": OpenCodeNativeForwarder._on_part_updated,
-    "message.part.delta": OpenCodeNativeForwarder._on_part_delta,
+    # NB: ``message.part.delta`` (live token stream) is intentionally NOT
+    # forwarded. The web chat view reconciles live ``text_delta`` previews with
+    # the committed item via a finalize/retire protocol; emitting deltas without
+    # that handshake left an unreconciled streaming preview alongside the
+    # committed message (duplicated/garbled chat). We post only the durable
+    # assistant item (the codex-native finalized-message path) so the chat is
+    # correct; live token-streaming is a separate follow-up.
     "session.status": OpenCodeNativeForwarder._on_session_status,
     "session.idle": OpenCodeNativeForwarder._on_session_idle,
     "session.error": OpenCodeNativeForwarder._on_session_error,

@@ -61,7 +61,13 @@ def _types(posts: list[tuple[str, dict[str, Any]]]) -> list[str]:
     return [body["type"] for _url, body in posts]
 
 
-async def test_text_delta_posts_output_text_delta() -> None:
+async def test_part_delta_is_not_forwarded() -> None:
+    """Live token deltas are intentionally dropped (see the _HANDLERS note).
+
+    The web chat view reconciles live ``text_delta`` previews with the
+    committed item via a finalize/retire handshake; emitting deltas without it
+    duplicated/garbled the chat. The forwarder posts only the durable item.
+    """
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
     await fwd.handle_event(
@@ -69,9 +75,7 @@ async def test_text_delta_posts_output_text_delta() -> None:
             "message.part.delta", field="text", partID="prt_1", messageID="msg_1", delta="hello"
         )
     )
-    assert "external_output_text_delta" in _types(server.posts)
-    delta_post = next(b for _u, b in server.posts if b["type"] == "external_output_text_delta")
-    assert delta_post["data"]["delta"] == "hello"
+    assert "external_output_text_delta" not in _types(server.posts)
 
 
 async def test_assistant_text_part_finalized_on_idle_and_dedupes() -> None:
