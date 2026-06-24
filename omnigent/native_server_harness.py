@@ -191,7 +191,7 @@ class NativeServerHarness(Executor):
             try:
                 await self.transport.send_prompt(session_id, prompt)
             except Exception:  # noqa: BLE001 - enqueue is best effort.
-                _logger.warning("%s enqueue failed", self.descriptor.id, exc_info=True)
+                _logger.warning("%s enqueue failed", self._harness_id, exc_info=True)
                 return False
         return True
 
