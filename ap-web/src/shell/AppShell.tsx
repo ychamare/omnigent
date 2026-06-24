@@ -1244,7 +1244,11 @@ export function AppShell() {
                     Tools and policies configured for the active agent.
                   </DialogDescription>
                 </DialogHeader>
-                <AgentInfoContent agent={boundAgent} sessionId={conversationId} showIntelligentRouting />
+                <AgentInfoContent
+                  agent={boundAgent}
+                  sessionId={conversationId}
+                  showIntelligentRouting
+                />
               </DialogContent>
             </Dialog>
           )}

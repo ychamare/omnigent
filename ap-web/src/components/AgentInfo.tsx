@@ -692,7 +692,11 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  * Shared by the desktop header popover ({@link AgentInfoButton}) and the
  * mobile header menu's agent-info dialog.
  */
-export function AgentInfoContent({ agent, sessionId, showIntelligentRouting = false }: AgentInfoProps) {
+export function AgentInfoContent({
+  agent,
+  sessionId,
+  showIntelligentRouting = false,
+}: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
   const [sessionIdCopied, setSessionIdCopied] = useState(false);
@@ -798,7 +802,11 @@ export function AgentInfoContent({ agent, sessionId, showIntelligentRouting = fa
  * header's three-dot menu, which opens {@link AgentInfoContent} in a
  * dialog. Self-hides when the agent has neither tools nor policies.
  */
-export function AgentInfoButton({ agent, sessionId, showIntelligentRouting = false }: AgentInfoProps) {
+export function AgentInfoButton({
+  agent,
+  sessionId,
+  showIntelligentRouting = false,
+}: AgentInfoProps) {
   if (!agentHasInfo(agent, sessionId)) return null;
 
   return (

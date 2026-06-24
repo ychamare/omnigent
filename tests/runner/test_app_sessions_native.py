@@ -4194,8 +4194,11 @@ class _FakeServerClient:
     exist. Tracks GET calls for assertion.
     """
 
-    def __init__(self, items: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, items: list[dict[str, Any]], *, session_snapshot: dict[str, Any] | None = None
+    ) -> None:
         self._items = items
+        self._session_snapshot: dict[str, Any] = session_snapshot or {}
         self.get_calls: list[dict[str, str]] = []
 
     async def get(
@@ -4204,6 +4207,19 @@ class _FakeServerClient:
         del timeout
         params = params or {}
         self.get_calls.append(dict(params))
+
+        # Session snapshot GET (e.g. /v1/sessions/{id}, no /items suffix).
+        if "/items" not in url:
+            snapshot = dict(self._session_snapshot)
+
+            class _SnapshotResp:
+                status_code = 200
+
+                def json(self_inner) -> dict[str, Any]:
+                    return snapshot
+
+            return _SnapshotResp()
+
         after = params.get("after")
         limit = int(params.get("limit", "100"))
 
@@ -13440,7 +13456,7 @@ class _LabelPatchRecordingServerClient(_FakeServerClient):
     """
 
     def __init__(self, items: list[dict[str, Any]]) -> None:
-        super().__init__(items)
+        super().__init__(items, session_snapshot={"cost_control_mode_override": "on"})
         self.label_patches: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON bodies
 
     async def patch(
@@ -13603,14 +13619,14 @@ async def test_optimize_turn_applies_model_and_injects_note(
 
 
 @pytest.mark.asyncio
-async def test_advise_turn_records_but_does_not_apply(
+async def test_advise_spec_escalates_to_apply_when_toggle_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An advise-mode turn shadows: the label persists (applied=False) but
-    the harness body carries NO model_override and NO note.
+    """An advise-spec turn with the toggle ON escalates to optimize: the
+    verdict is applied (model_override set, note injected, applied=True).
 
-    Mutation proof against the optimize test: same judge, same harness, only
-    the mode differs — yet nothing is applied, isolating "advise = shadow".
+    The toggle is the source of truth — "on" means apply regardless of
+    the spec mode, so advise escalates to optimize.
 
     :param monkeypatch: Replaces the production judge with the stub.
     """
@@ -13655,19 +13671,21 @@ async def test_advise_turn_records_but_does_not_apply(
         assert resp2.status_code == 200
         assert "response.completed" in resp2.text
 
-    # Verdict recorded for telemetry, but applied=False (shadow).
+    # Toggle ON + advise spec → escalated to optimize → applied=True.
     label_bodies = [body for body in server_client.label_patches if "labels" in body]
     assert len(label_bodies) == 1
     verdict = parse_verdict(label_bodies[0]["labels"])
     assert verdict is not None
-    assert verdict.applied is False
+    assert verdict.model == "model-pricey"
+    assert verdict.applied is True
 
-    # No application: the harness body has no model_override and no note —
-    # advise mode leaves the brain untouched.
+    # Escalated application: the harness body carries model_override and a note.
     assert len(hc.posted_bodies) == 1
     body = hc.posted_bodies[0]
-    assert body.get("model_override") is None, "advise mode must not switch the brain model"
-    assert _advisor_note_items(body.get("content") or []) == []
+    assert body.get("model_override") == "model-pricey"
+    assert _advisor_note_items(body.get("content") or []) == [
+        "[Cost advisor: this turn runs on model-pricey (expensive)]"
+    ]
 
 
 @pytest.mark.asyncio

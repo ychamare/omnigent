@@ -1481,7 +1481,7 @@ export function NewChatLandingScreen() {
               <div className="flex items-center gap-0.5">
                 {/* Polly-only surface — cost control is a polly feature, so
                     the toggle is hidden unless the selected agent is polly. */}
-                                {selectedAgent?.name === "polly" && (
+                {selectedAgent?.name === "polly" && (
                   // Mode-only variant: no verdict can exist before the session does.
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}

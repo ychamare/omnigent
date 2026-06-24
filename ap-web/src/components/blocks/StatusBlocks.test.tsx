@@ -47,7 +47,12 @@ describe("RoutingDecisionChip — intelligent model router", () => {
 
   it("renders nothing for the rationale line when rationale is empty", () => {
     render(
-      <RoutingDecisionChip model="databricks-claude-sonnet-4-6" tier="medium" applied rationale="" />,
+      <RoutingDecisionChip
+        model="databricks-claude-sonnet-4-6"
+        tier="medium"
+        applied
+        rationale=""
+      />,
     );
     const chip = screen.getByTestId("routing-decision-chip");
     // Empty rationale still renders the primary line, just no second line —
@@ -58,7 +63,12 @@ describe("RoutingDecisionChip — intelligent model router", () => {
 
   it("never uses the old 'model control' vocabulary (rename sweep)", () => {
     render(
-      <RoutingDecisionChip model="databricks-claude-opus-4-8" tier="expensive" applied rationale="x" />,
+      <RoutingDecisionChip
+        model="databricks-claude-opus-4-8"
+        tier="expensive"
+        applied
+        rationale="x"
+      />,
     );
     const chip = screen.getByTestId("routing-decision-chip");
     // The feature was renamed from "Intelligent model control"; the chip

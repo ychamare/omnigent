@@ -7,7 +7,13 @@
 //   The in-progress state renders as a Shimmer in ChatPage, mirroring
 //   the "Working…" indicator.
 
-import { AlertCircleIcon, RotateCcwIcon, ShieldXIcon, ShrinkIcon, WaypointsIcon } from "lucide-react";
+import {
+  AlertCircleIcon,
+  RotateCcwIcon,
+  ShieldXIcon,
+  ShrinkIcon,
+  WaypointsIcon,
+} from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
 
