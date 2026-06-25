@@ -674,14 +674,14 @@ async def test_elicitation_post_returns_none_when_budget_exhausted(
     assert len(client.posts) == 1
 
 
-# ── #1108: error-item "silent success" → surfaced failed ──────────────
+# ── #1108: turn-error "silent success" → surfaced failed ──────────────
 #
-# Codex can complete a turn that carries an ``item/completed`` ``error`` item
-# but still report it via ``turn/completed`` (a clean success boundary). These
-# tests pin the surface-only fix: such turns are forced to ``failed``, the
-# reason is surfaced as the status output, auth errors carry a re-auth hint,
-# the resume path reaches the same verdict, an empty turn is idle (+ WARN),
-# and a genuinely clean turn still reports success.
+# A failed Codex turn arrives as ``turn/completed`` (a clean success boundary)
+# with ``turn.status == "failed"`` and a ``turn.error`` object. These tests pin
+# the surface-only fix: such turns are forced to ``failed``, the reason is
+# surfaced as the status output, auth errors (codexErrorInfo / 401-403) carry a
+# re-auth hint, the resume path reaches the same verdict, an empty turn is idle
+# (+ WARN), and a genuinely clean turn still reports success.
 
 
 def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
@@ -709,34 +709,40 @@ def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
 
 
 def test_classify_codex_error_auth_vs_generic() -> None:
-    """The shared classifier flags auth phrasings and leaves the rest generic.
+    """The shared classifier flags auth errors and leaves the rest generic.
 
     This is the single classifier reused by both the live and resume paths;
     if it regresses, an expired-login failure would surface without the
-    re-auth hint (or a disk-full error would wrongly demand re-auth).
+    re-auth hint (or a disk-full error would wrongly demand re-auth). It
+    prefers ``codexErrorInfo`` (variant / httpStatusCode) and falls back to
+    the message text.
     """
-    assert fwd._classify_codex_error("401 Unauthorized") == fwd._CODEX_ERROR_KIND_AUTH
-    assert fwd._classify_codex_error("Please run codex login") == fwd._CODEX_ERROR_KIND_AUTH
-    assert fwd._classify_codex_error("ChatGPT session expired") == fwd._CODEX_ERROR_KIND_AUTH
-    assert fwd._classify_codex_error("disk full while writing patch") == (
-        fwd._CODEX_ERROR_KIND_GENERIC
-    )
+    auth = fwd._CODEX_ERROR_KIND_AUTH
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    # Structured codexErrorInfo: string variant, tagged object, http status.
+    assert fwd._classify_codex_error({"codexErrorInfo": "Unauthorized"}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"type": "Unauthorized"}}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 401}}, "nope") == auth
+    # Message-text fallback when codexErrorInfo is absent.
+    assert fwd._classify_codex_error({}, "Please run codex login") == auth
+    assert fwd._classify_codex_error({}, "ChatGPT session expired") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": "Other"}, "disk full") == generic
 
 
-def test_terminal_error_from_turn_finds_and_classifies_error_item() -> None:
-    """``_terminal_error_from_turn`` returns the classified error item.
+def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
+    """``_terminal_error_from_turn`` returns the classified ``turn.error``.
 
-    The helper is the single source of truth for "did this turn error"; both
-    edge builders depend on it, so it must find the error item and classify it.
+    The helper is the single source of truth for "did this turn fail"; both
+    edge builders depend on it, so it must read ``turn.error`` and classify it.
     """
     params = {
         "turn": {
             "id": "turn_123",
-            "status": "completed",
-            "items": [
-                {"type": "agentMessage", "id": "a", "text": "working"},
-                {"type": "error", "message": "401 Unauthorized: login expired"},
-            ],
+            "status": "failed",
+            "error": {
+                "message": "401 Unauthorized: login expired",
+                "codexErrorInfo": "Unauthorized",
+            },
         }
     }
 
@@ -749,7 +755,7 @@ def test_terminal_error_from_turn_finds_and_classifies_error_item() -> None:
 
 
 def test_terminal_error_from_turn_none_for_clean_turn() -> None:
-    """A turn with no error item yields ``None`` (no false positives)."""
+    """A turn with no ``error`` object yields ``None`` (no false positives)."""
     params = {
         "turn": {
             "id": "turn_123",
@@ -761,20 +767,19 @@ def test_terminal_error_from_turn_none_for_clean_turn() -> None:
     assert fwd._terminal_error_from_turn(params) is None
 
 
-def test_terminal_turn_status_edge_error_item_forces_failed(tmp_path: Path) -> None:
-    """A ``turn/completed`` carrying an error item is forced to ``failed``.
+def test_terminal_turn_status_edge_turn_error_forces_failed(tmp_path: Path) -> None:
+    """A ``turn/completed`` carrying ``turn.error`` is forced to ``failed``.
 
     This is the core of #1108: Codex reported a *completed* boundary, but the
-    turn actually contained an error item. The edge must be ``failed`` (not the
-    silent ``idle`` the method alone implies) and carry the classified error so
-    the reason can be surfaced.
+    turn actually failed. The edge must be ``failed`` (not the silent ``idle``
+    the method alone implies) and carry the classified error.
     """
     _seed_active_turn(tmp_path, "turn_123")
     params = {
         "turn": {
             "id": "turn_123",
-            "status": "completed",
-            "items": [{"type": "error", "message": "model stream broke"}],
+            "status": "failed",
+            "error": {"message": "model stream broke"},
         }
     }
 
@@ -786,17 +791,20 @@ def test_terminal_turn_status_edge_error_item_forces_failed(tmp_path: Path) -> N
     assert edge.error is not None
     assert edge.error.message == "model stream broke"
     assert edge.error.kind == fwd._CODEX_ERROR_KIND_GENERIC
-    assert edge.source == "turn/completed:error-item"
+    assert edge.source == "turn/completed:turn-error"
 
 
-def test_terminal_turn_status_edge_auth_error_item_classified(tmp_path: Path) -> None:
-    """An auth-classified error item rides the failed edge as ``auth``."""
+def test_terminal_turn_status_edge_auth_turn_error_classified(tmp_path: Path) -> None:
+    """An auth-classified ``turn.error`` rides the failed edge as ``auth``."""
     _seed_active_turn(tmp_path, "turn_123")
     params = {
         "turn": {
             "id": "turn_123",
-            "status": "completed",
-            "items": [{"type": "error", "message": "403 Forbidden: not logged in"}],
+            "status": "failed",
+            "error": {
+                "message": "Forbidden",
+                "codexErrorInfo": {"type": "Unauthorized", "httpStatusCode": 403},
+            },
         }
     }
 
@@ -808,11 +816,28 @@ def test_terminal_turn_status_edge_auth_error_item_classified(tmp_path: Path) ->
     assert edge.error.is_auth is True
 
 
+def test_terminal_turn_status_edge_failed_status_without_error(tmp_path: Path) -> None:
+    """A ``turn.status == "failed"`` with no ``error`` object still fails.
+
+    Defends against an app-server version that records the failed status but
+    omits the populated ``turn.error`` — the edge must not fall back to ``idle``.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {"turn": {"id": "turn_123", "status": "failed"}}
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is None
+    assert edge.source == "turn/completed:turn-failed"
+
+
 def test_terminal_turn_status_edge_clean_turn_still_idle(tmp_path: Path) -> None:
     """A genuinely clean ``turn/completed`` still maps to ``idle`` (regression).
 
-    The error-item check must not break the happy path: no error item → the
-    edge stays ``idle`` with no attached error.
+    The turn-error check must not break the happy path: no error → the edge
+    stays ``idle`` with no attached error.
     """
     _seed_active_turn(tmp_path, "turn_123")
     params = {
@@ -855,8 +880,8 @@ def test_terminal_turn_status_edge_empty_turn_idle_and_warns(
     ), "expected a WARN log for the empty (zero-item) turn"
 
 
-def test_omnigent_status_from_resume_turn_error_item_parity() -> None:
-    """Resume parity: a completed resume turn with an error item → ``failed``.
+def test_omnigent_status_from_resume_turn_error_parity() -> None:
+    """Resume parity: a completed resume turn carrying ``turn.error`` → ``failed``.
 
     Without this, a reconnect that backfills from ``thread/resume`` would close
     the session as ``idle`` even though the turn had errored — the resume-path
@@ -865,7 +890,7 @@ def test_omnigent_status_from_resume_turn_error_item_parity() -> None:
     turn_with_error = {
         "id": "turn_123",
         "status": "completed",
-        "items": [{"type": "error", "message": "rate limited"}],
+        "error": {"message": "rate limited"},
     }
     turn_clean = {
         "id": "turn_123",
@@ -893,8 +918,8 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
     turns = [
         {
             "id": "turn_123",
-            "status": "completed",
-            "items": [{"type": "error", "message": "please sign in again"}],
+            "status": "failed",
+            "error": {"message": "please sign in again"},
         }
     ]
 
@@ -904,7 +929,7 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
     assert edge.status == "failed"
     assert edge.error is not None
     assert edge.error.is_auth is True
-    assert edge.source == "thread/resume:error-item"
+    assert edge.source == "thread/resume:turn-error"
     # The active turn id is cleared once the terminal edge is derived.
     state = read_bridge_state(tmp_path)
     assert state is not None
@@ -922,7 +947,7 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
     edge = fwd._CodexTurnStatusEdge(
         status="failed",
         turn_id="turn_123",
-        source="turn/completed:error-item",
+        source="turn/completed:turn-error",
         error=fwd._CodexTerminalError(
             message="model stream broke",
             kind=fwd._CODEX_ERROR_KIND_GENERIC,
@@ -948,7 +973,7 @@ async def test_post_turn_status_edge_auth_error_includes_reauth_hint() -> None:
     edge = fwd._CodexTurnStatusEdge(
         status="failed",
         turn_id="turn_123",
-        source="turn/completed:error-item",
+        source="turn/completed:turn-error",
         error=fwd._CodexTerminalError(
             message="401 Unauthorized",
             kind=fwd._CODEX_ERROR_KIND_AUTH,

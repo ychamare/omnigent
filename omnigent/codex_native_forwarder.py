@@ -115,24 +115,21 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     }
 )
 
-# Error-item classification (#1108). Codex can complete a turn that carries an
-# ``item/completed`` ``error`` item but still report the turn as a clean
-# ``turn/completed`` — a "silent success". The forwarder forces such turns to
-# ``failed`` and surfaces the reason. ``_CODEX_ERROR_ITEM_TYPE`` is the Codex
-# item type that marks a turn-level error.
-_CODEX_ERROR_ITEM_TYPE = "error"
-# Substrings (matched case-insensitively against the error message) that mark an
-# error as authentication-related, so the surface can include a re-auth hint.
-# Kept deliberately broad: Codex auth failures surface in several phrasings
-# (expired ChatGPT login, 401/403 from the responses API, "run codex login").
-# The broad ``login`` / ``sign in`` tokens are retained intentionally rather
-# than gated on co-occurring auth context: ``"run codex login"`` is the
-# canonical Codex re-auth error and ``login`` is its only signal, so requiring
-# extra context would weaken detection of the exact failure this hint exists
-# for. Because Phase 1 is surface-only, a false positive merely appends a
-# re-auth hint to an already-failed turn (cheap), whereas a false negative
-# leaves the user unaware they must re-authenticate (costly) — the asymmetry
-# favors recall over precision here.
+# Turn-error surfacing (#1108). A failed Codex turn arrives as ``turn/completed``
+# (or ``turn/failed``) with ``turn.status == "failed"`` and a ``turn.error``
+# object ``{message, codexErrorInfo?, additionalDetails?}``; keying status off
+# the method alone mapped such turns to ``idle`` — a "silent success". The
+# forwarder inspects ``turn.status``/``turn.error``, forces ``failed``, and
+# surfaces the reason.
+#
+# ``codexErrorInfo`` is the app-server's structured classification (e.g.
+# ``Unauthorized``, ``UsageLimitExceeded``); auth-class values get a re-auth
+# hint. httpStatusCode 401/403 is treated as auth too.
+_CODEX_AUTH_ERROR_INFO = frozenset({"Unauthorized"})
+_CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
+# Message-substring fallback for app-server versions that omit codexErrorInfo.
+# Surface-only, so recall is favored over precision: a false positive only
+# appends a re-auth hint to an already-failed turn.
 _CODEX_AUTH_ERROR_FRAGMENTS = (
     "401",
     "403",
@@ -152,12 +149,8 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
     "session expired",
     "api key",
 )
-# Surfaced classifications for a terminal error item.
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
-# Re-auth hint appended to the surfaced status output for an auth-classified
-# error so the web UI / parent can prompt the user to re-authenticate. Phase 1
-# is surface-only: no automatic ``codex login`` is triggered.
 _CODEX_REAUTH_HINT = "Codex needs you to re-authenticate. Run `codex login` and retry."
 
 
@@ -683,17 +676,16 @@ class _CodexForwarderState:
 @dataclass(frozen=True)
 class _CodexTerminalError:
     """
-    A turn-level error item surfaced from a Codex turn (#1108).
+    A turn-level failure surfaced from a Codex turn (#1108).
 
-    Produced by :func:`_terminal_error_from_turn` when a turn carries an
-    ``item/completed`` ``error`` item. Forces the turn's Omnigent status to
-    ``failed`` and lets :func:`_post_turn_status_edge` surface the reason
-    (and a re-auth hint for auth-classified errors).
+    Produced by :func:`_terminal_error_from_turn` from ``turn.error``. Forces
+    the turn's Omnigent status to ``failed`` and lets
+    :func:`_post_turn_status_edge` surface the reason (and a re-auth hint for
+    auth-classified errors).
 
-    :param message: Human-readable error text from the Codex error item,
+    :param message: Human-readable error text from ``turn.error.message``,
         e.g. ``"401 Unauthorized: ChatGPT login expired"``.
-    :param kind: Classification, either ``"auth"`` or ``"generic"``, from
-        the shared :func:`_classify_codex_error` classifier.
+    :param kind: Classification, either ``"auth"`` or ``"generic"``.
     """
 
     message: str
@@ -705,75 +697,71 @@ class _CodexTerminalError:
         return self.kind == _CODEX_ERROR_KIND_AUTH
 
 
-def _classify_codex_error(message: str) -> str:
+def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     """
-    Classify a Codex error message as auth-related or generic.
+    Classify a Codex ``turn.error`` as auth-related or generic.
 
-    Single shared classifier reused by both the live terminal path and the
-    ``thread/resume`` parity path so the two never diverge. Matching is
-    case-insensitive substring containment against
-    :data:`_CODEX_AUTH_ERROR_FRAGMENTS`.
+    Prefers the structured ``codexErrorInfo`` (``Unauthorized`` or an
+    httpStatusCode of 401/403); falls back to substring matching against
+    :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions that omit it.
 
-    :param message: Error message text, e.g.
-        ``"401 Unauthorized: please run codex login"``.
-    :returns: :data:`_CODEX_ERROR_KIND_AUTH` when any auth fragment matches,
-        otherwise :data:`_CODEX_ERROR_KIND_GENERIC`.
+    :param error: The ``turn.error`` object.
+    :param message: Its already-extracted message text.
+    :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
+        :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
+    info = error.get("codexErrorInfo")
+    variant: str | None = None
+    http_status: Any = None
+    if isinstance(info, str):
+        variant = info
+    elif isinstance(info, dict):
+        variant = info.get("type") or info.get("kind") or info.get("variant")
+        http_status = info.get("httpStatusCode")
+    if variant in _CODEX_AUTH_ERROR_INFO or http_status in _CODEX_AUTH_HTTP_STATUS:
+        return _CODEX_ERROR_KIND_AUTH
     lowered = message.lower()
-    for fragment in _CODEX_AUTH_ERROR_FRAGMENTS:
-        if fragment in lowered:
-            return _CODEX_ERROR_KIND_AUTH
+    if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
+        return _CODEX_ERROR_KIND_AUTH
     return _CODEX_ERROR_KIND_GENERIC
 
 
-def _error_message_from_item(item: dict[str, Any]) -> str:
+def _error_message_from_turn_error(error: dict[str, Any]) -> str:
     """
-    Extract a human-readable message from a Codex ``error`` item.
+    Extract a non-empty message from a Codex ``turn.error`` object.
 
-    Codex error items have surfaced the text under a few keys across
-    app-server versions (``message``, ``error``, ``text``); this reads the
-    first non-empty string, falling back to a stable generic message so the
-    surfaced error is never blank (``ErrorData`` rejects empty text).
-
-    :param item: A Codex ``item/completed`` item with ``type == "error"``.
-    :returns: Non-empty error message text.
+    :param error: The ``turn.error`` object, e.g.
+        ``{"message": "401 Unauthorized", "codexErrorInfo": "Unauthorized"}``.
+    :returns: Non-empty error text (a stable fallback when ``message`` is blank).
     """
-    for key in ("message", "error", "text", "detail"):
-        value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+    message = error.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
     return "Codex turn ended with an unspecified error."
 
 
 def _terminal_error_from_turn(params: dict[str, Any]) -> _CodexTerminalError | None:
     """
-    Return the first turn-level error item from a Codex turn, if any (#1108).
+    Return the turn-level failure carried by a Codex turn, if any (#1108).
 
-    Scans ``params['turn']['items']`` for an item whose ``type`` is
-    :data:`_CODEX_ERROR_ITEM_TYPE` and classifies it via the shared
-    :func:`_classify_codex_error`. This is the single source of truth for
-    "did this turn actually contain an error", reused by both the live
-    terminal edge and the ``thread/resume`` parity path.
+    A failed turn carries ``turn.status == "failed"`` and a ``turn.error``
+    object (per the app-server protocol). This reads and classifies that
+    error and is the single source of truth reused by the live terminal edge
+    and the ``thread/resume`` parity path.
 
     :param params: Codex turn params, e.g. a ``turn/completed`` payload or a
         single ``thread/resume`` turn wrapped as ``{"turn": <turn>}``.
-    :returns: The classified terminal error, or ``None`` when the turn has no
-        error item.
+    :returns: The classified terminal error, or ``None`` when the turn did not
+        fail.
     """
     turn = params.get("turn")
     if not isinstance(turn, dict):
         return None
-    items = turn.get("items")
-    if not isinstance(items, list):
+    error = turn.get("error")
+    if not isinstance(error, dict):
         return None
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") != _CODEX_ERROR_ITEM_TYPE:
-            continue
-        message = _error_message_from_item(item)
-        return _CodexTerminalError(message=message, kind=_classify_codex_error(message))
-    return None
+    message = _error_message_from_turn_error(error)
+    return _CodexTerminalError(message=message, kind=_classify_codex_error(error, message))
 
 
 @dataclass(frozen=True)
@@ -2055,13 +2043,13 @@ def _resume_terminal_status_edge_for_latest_turn(
         if status is None:
             return None
         update_active_turn_id(bridge_dir, None)
-        # #1108: parity with the live path — surface the error item (if any)
+        # #1108: parity with the live path — surface ``turn.error`` (if any)
         # that forced this resume turn to ``failed``.
         error = _terminal_error_from_turn({"turn": turn})
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
-            source="thread/resume:error-item" if error is not None else "thread/resume",
+            source="thread/resume:turn-error" if error is not None else "thread/resume",
             error=error,
         )
     return None
@@ -2071,17 +2059,17 @@ def _omnigent_status_from_resume_turn(turn: dict[str, Any]) -> str | None:
     """
     Convert an explicit Codex resume turn status to Omnigent session status.
 
-    Applies the same error-item check as the live terminal path
+    Applies the same ``turn.error`` check as the live terminal path
     (:func:`_terminal_turn_status_edge`) so a resumed turn that carried an
-    ``error`` item maps to ``failed`` even when Codex recorded its status as
-    ``completed`` — the resume-path side of the #1108 "silent success" fix.
+    error maps to ``failed`` even if its recorded status is not — the
+    resume-path side of the #1108 "silent success" fix.
 
     :param turn: Codex resume turn object, e.g.
         ``{"id": "turn_123", "status": "completed"}``.
     :returns: Omnigent status literal for terminal turns, or ``None`` for active
         or unrecognized statuses.
     """
-    # An error item forces ``failed`` regardless of the recorded turn status.
+    # A ``turn.error`` forces ``failed`` regardless of the recorded status.
     if _terminal_error_from_turn({"turn": turn}) is not None:
         return "failed"
     status = turn.get("status")
@@ -3354,13 +3342,13 @@ def _terminal_turn_status_edge(
         source = f"{method}:recovered"
     else:
         source = method
-    # #1108: a turn that carries an ``error`` item is a failure even if Codex
-    # reported it via ``turn/completed`` ("silent success"). Force ``failed``
-    # and attach the classified error so the reason is surfaced downstream.
+    # #1108: a failed turn carries ``turn.status == "failed"`` + ``turn.error``
+    # even when Codex reports it via ``turn/completed`` ("silent success").
+    # Force ``failed`` and attach the error so the reason is surfaced downstream.
     error = _terminal_error_from_turn(params)
     if error is not None:
         _logger.info(
-            "Codex forwarder forcing failed status from error item: turn_id=%s method=%s kind=%s",
+            "Codex forwarder forcing failed status from turn.error: turn_id=%s method=%s kind=%s",
             terminal_turn_id,
             method,
             error.kind,
@@ -3368,8 +3356,19 @@ def _terminal_turn_status_edge(
         return _CodexTurnStatusEdge(
             status="failed",
             turn_id=terminal_turn_id,
-            source=f"{source}:error-item",
+            source=f"{source}:turn-error",
             error=error,
+        )
+    if _turn_status_is_failed(params):
+        _logger.info(
+            "Codex forwarder forcing failed status from turn.status: turn_id=%s method=%s",
+            terminal_turn_id,
+            method,
+        )
+        return _CodexTurnStatusEdge(
+            status="failed",
+            turn_id=terminal_turn_id,
+            source=f"{source}:turn-failed",
         )
     if method == "turn/completed" and _turn_items_are_empty(params):
         _logger.warning(
@@ -3383,6 +3382,26 @@ def _terminal_turn_status_edge(
         turn_id=terminal_turn_id,
         source=source,
     )
+
+
+def _turn_status_is_failed(params: dict[str, Any]) -> bool:
+    """
+    Report whether a Codex turn recorded a ``failed`` status (#1108).
+
+    Catches a failure that lacks a populated ``turn.error`` object, so a
+    ``turn/completed`` whose ``turn.status`` is ``failed`` still maps to
+    ``failed`` rather than ``idle``.
+
+    :param params: Codex turn event params.
+    :returns: ``True`` when ``params['turn']['status']`` resolves to ``failed``.
+    """
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return False
+    status = turn.get("status")
+    if isinstance(status, dict):
+        status = status.get("type") or status.get("status")
+    return status in {"failed", "errored"}
 
 
 def _turn_items_are_empty(params: dict[str, Any]) -> bool:

@@ -8860,17 +8860,11 @@ def create_runner_app(
                     }
                 )
             elif item_type == "error":
-                # #1108: error items used to be silently dropped here, so a
-                # turn that actually failed replayed as if it had never erred
-                # ("silent success"). Preserve the error as a typed ``error``
-                # item — the same shape ``ErrorData.to_api_dict`` produces
-                # (source/code/message) — rather than a synthetic user
-                # message. This keeps the failure visible AND attributed as
-                # an error (not as user input), and round-trips the stable
-                # ``code`` for downstream classification. Like other non-
-                # message items (function_call, etc.), the harness input
-                # translator skips it for LLM context, but it survives the
-                # conversion instead of being dropped on the floor.
+                # #1108: error items were silently dropped here, so a failed
+                # turn replayed as if it had never erred. Preserve it as a
+                # typed ``error`` item (the source/code/message shape
+                # ``ErrorData.to_api_dict`` produces) so the failure survives
+                # reload and stays attributed as an error, not user input.
                 message = item.get("message")
                 code = item.get("code")
                 source = item.get("source")
