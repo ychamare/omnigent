@@ -165,15 +165,26 @@ to `/policies/evaluate` → the cost-budget gate reads the session cost (from th
   session (low enough to trip within a couple of turns).
 - Steps: run turns until cumulative cost crosses the budget, then have the model
   attempt another tool call.
-- Expected:
+- Expected (web surface):
   - On the crossing, the next gated tool call surfaces the **cost-budget
     approval card** (ASK) and **blocks** opencode's tool until resolved — or, for
     a hard cap, **denies** it. (opencode genuinely waits on the permission reply.)
   - The cost the gate sees matches the web cost badge (both from
     `external_session_usage`).
-  - Known limitation to confirm, not flag as a bug: enforcement can lag the
-    in-flight turn by one message (the turn's cost posts on completion), same as
-    claude/codex.
+- Expected (**TUI surface — the fix**): the SAME checkpoint pops a
+  `tmux display-popup` cost-approval modal on the `opencode attach` pane, so a
+  user working in the TUI is blocked too (not just the web) — matching
+  claude/codex. Test both: (a) hit the budget while in the Terminal → popup
+  appears on the pane; (b) hit it while in web Chat, then open the Terminal →
+  the pending approval **re-pops** on attach.
+- Known limitations to confirm, not flag as bugs:
+  - Enforcement is **tool-call-phase only**. opencode has no prompt-submit hook
+    (claude-native's `UserPromptSubmit`), so a TUI turn is blocked at its **first
+    gated tool call**, not at the moment the message is sent. A pure-text turn
+    with no tool calls can slip one turn. (Most agentic turns call tools, so this
+    blocks real work; it's an opencode platform limit, not a wiring gap.)
+  - Enforcement can lag the in-flight turn by one message (the turn's cost posts
+    on completion), same as claude/codex.
 
 ---
 
