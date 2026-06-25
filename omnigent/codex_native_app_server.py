@@ -1544,36 +1544,58 @@ _CODEX_APPROVAL_SANDBOX_FLAGS = frozenset({"--sandbox", "--ask-for-approval"})
 
 def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     """
-    Drop granular ``--sandbox`` / ``--ask-for-approval`` flag pairs.
+    Drop granular ``--sandbox`` / ``--ask-for-approval`` flags (and values).
 
     Used when the full-bypass flag is enabled: codex rejects the bypass
     flag when it is combined with either granular flag, so each such flag
-    is removed together with its immediately following value. Any
-    already-present bypass flag is also dropped so the caller can re-add a
-    single canonical copy. Unrelated args (model, config overrides, ...)
-    pass through untouched.
+    is removed. Both CLI spellings are handled:
+
+    - ``--sandbox=read-only`` (single ``--flag=value`` token) is dropped
+      whole.
+    - ``--sandbox read-only`` (separate flag + value) drops the flag and
+      its following value — but ONLY when that next token is actually a
+      value (it does not itself start with ``-``). A following
+      ``--something`` is a separate flag, not this flag's value, so it is
+      left in place (e.g. ``("--sandbox", "--model", "gpt")`` keeps
+      ``"--model", "gpt"``). A trailing flag at end-of-list is dropped
+      cleanly with no value to consume.
+
+    Any already-present bypass flag is also dropped so the caller can
+    re-add a single canonical copy. Unrelated args (model, config
+    overrides, ...) pass through untouched.
 
     :param codex_args: Raw Codex CLI args, e.g.
         ``("--sandbox", "read-only", "--model", "gpt-5.4-mini")``.
-    :returns: ``codex_args`` with the conflicting flag pairs removed, e.g.
+    :returns: ``codex_args`` with the conflicting flags removed, e.g.
         ``["--model", "gpt-5.4-mini"]``.
     """
     cleaned: list[str] = []
-    skip_next = False
-    for arg in codex_args:
-        if skip_next:
-            # This is the value belonging to a stripped flag.
-            skip_next = False
-            continue
+    i = 0
+    n = len(codex_args)
+    while i < n:
+        arg = codex_args[i]
         if arg in _CODEX_APPROVAL_SANDBOX_FLAGS:
-            # Drop the flag and its following value (a ``--flag value`` pair).
-            skip_next = True
+            # ``--flag value``: drop the flag, and consume the NEXT token as
+            # its value ONLY when that token is a real value — it exists and
+            # does not itself start with ``-`` (a leading ``-`` marks a
+            # separate flag, e.g. ``("--sandbox", "--model", "gpt")`` keeps
+            # ``--model``; a trailing flag at end-of-list consumes nothing).
+            if i + 1 < n and not codex_args[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in _CODEX_APPROVAL_SANDBOX_FLAGS):
+            # ``--flag=value`` single token: drop it whole, consume nothing.
+            i += 1
             continue
         if arg == _CODEX_BYPASS_SANDBOX_FLAG:
             # Drop any pre-existing bypass flag; a single canonical copy is
             # re-added by the caller so it is never duplicated.
+            i += 1
             continue
         cleaned.append(arg)
+        i += 1
     return cleaned
 
 

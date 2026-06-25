@@ -662,6 +662,48 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
     )
 
 
+@pytest.mark.parametrize(
+    ("codex_args", "expected"),
+    [
+        # ``--flag value`` pair: both dropped.
+        (("--sandbox", "read-only"), []),
+        (("--ask-for-approval", "on-request"), []),
+        # Option-adjacent: the next token is ANOTHER flag, not this flag's
+        # value, so it must survive (the over-match bug dropped --model).
+        (("--sandbox", "--model", "gpt"), ["--model", "gpt"]),
+        # ``--flag=value`` single token: dropped whole, consumes nothing after.
+        (("--ask-for-approval=on-failure",), []),
+        (("--sandbox=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Trailing flag at end-of-list: dropped cleanly, no value to consume.
+        (("--model", "gpt", "--sandbox"), ["--model", "gpt"]),
+        # Unrelated arg next to a stripped pair is preserved.
+        (
+            ("--model", "gpt", "--sandbox", "read-only", "--cwd", "/x"),
+            ["--model", "gpt", "--cwd", "/x"],
+        ),
+        # A pre-existing bypass flag is de-duped (the caller re-adds one copy).
+        (("--dangerously-bypass-approvals-and-sandbox", "--model", "gpt"), ["--model", "gpt"]),
+        # No conflicting flags: everything passes through untouched.
+        (("--model", "gpt-5.4-mini"), ["--model", "gpt-5.4-mini"]),
+    ],
+)
+def test_strip_approval_sandbox_flags_only_consumes_real_values(
+    codex_args: tuple[str, ...],
+    expected: list[str],
+) -> None:
+    """
+    ``_strip_approval_sandbox_flags`` drops the conflicting flags without
+    over-matching the token that follows them.
+
+    A ``--sandbox`` / ``--ask-for-approval`` flag consumes the next token as
+    its value ONLY when that token is a real value (does not start with
+    ``-``); a following flag or end-of-list consumes nothing, so unrelated
+    args like ``--model gpt`` are never swallowed. The ``--flag=value``
+    single-token spelling is dropped whole.
+    """
+    assert codex_native_app_server._strip_approval_sandbox_flags(codex_args) == expected
+
+
 def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> None:
     """
     Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the

@@ -778,17 +778,20 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-checked")).toBe("false");
     expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
-    // A near-miss phrase does NOT unlock the toggle.
+    // Confirmation is VERBATIM — none of these near-misses unlock the toggle:
+    // a prefix, a different case, or leading/trailing whitespace.
+    for (const nearMiss of ["bypass", "Bypass Sandbox", " bypass sandbox", "bypass sandbox "]) {
+      fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
+        target: { value: nearMiss },
+      });
+      expect(
+        (screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement)
+          .disabled,
+      ).toBe(true);
+    }
+    // Only the exact phrase unlocks it; flipping on renders the red banner.
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
-      target: { value: "bypass" },
-    });
-    expect(
-      (screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement).disabled,
-    ).toBe(true);
-    // The exact phrase (case-insensitive) unlocks it; flipping on renders the
-    // red warning banner.
-    fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
-      target: { value: "Bypass Sandbox" },
+      target: { value: "bypass sandbox" },
     });
     const armed = screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement;
     expect(armed.disabled).toBe(false);

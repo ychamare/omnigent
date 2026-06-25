@@ -695,8 +695,10 @@ function BypassSandboxOption({
   onEnabledChange: (enabled: boolean) => void;
 }) {
   const [confirmText, setConfirmText] = useState<string>("");
-  const phraseMatches =
-    confirmText.trim().toLowerCase() === CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE;
+  // VERBATIM match — no trim, no case-folding. The user must type exactly the
+  // phrase we display (CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE); a stray
+  // space or different case must NOT arm this dangerous mode.
+  const phraseMatches = confirmText === CODEX_NATIVE_BYPASS_SANDBOX_CONFIRM_PHRASE;
   // The toggle can only be flipped ON once the phrase matches; it can always
   // be flipped OFF. A click while unconfirmed is ignored (defense in depth on
   // top of the disabled attribute).
