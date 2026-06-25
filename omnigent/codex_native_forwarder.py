@@ -120,11 +120,14 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
 # object ``{message, codexErrorInfo?, additionalDetails?}``; keying status off
 # the method alone mapped such turns to ``idle`` — a "silent success". The
 # forwarder inspects ``turn.status``/``turn.error``, forces ``failed``, and
-# surfaces the reason.
+# surfaces the reason. As a fallback it also catches an ``error`` ThreadItem in
+# ``turn.items``: both shapes exist in the app-server type system and the wire
+# shape varies by version, so detecting either keeps the fix robust.
 #
 # ``codexErrorInfo`` is the app-server's structured classification (e.g.
 # ``Unauthorized``, ``UsageLimitExceeded``); auth-class values get a re-auth
 # hint. httpStatusCode 401/403 is treated as auth too.
+_CODEX_ERROR_ITEM_TYPE = "error"
 _CODEX_AUTH_ERROR_INFO = frozenset({"Unauthorized"})
 _CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
 # Message-substring fallback for app-server versions that omit codexErrorInfo.
@@ -678,13 +681,13 @@ class _CodexTerminalError:
     """
     A turn-level failure surfaced from a Codex turn.
 
-    Produced by :func:`_terminal_error_from_turn` from ``turn.error``. Forces
-    the turn's Omnigent status to ``failed`` and lets
-    :func:`_post_turn_status_edge` surface the reason (and a re-auth hint for
-    auth-classified errors).
+    Produced by :func:`_terminal_error_from_turn` from ``turn.error`` or an
+    ``error`` ThreadItem. Forces the turn's Omnigent status to ``failed`` and
+    lets :func:`_post_turn_status_edge` surface the reason (and a re-auth hint
+    for auth-classified errors).
 
-    :param message: Human-readable error text from ``turn.error.message``,
-        e.g. ``"401 Unauthorized: ChatGPT login expired"``.
+    :param message: Human-readable error text, e.g.
+        ``"401 Unauthorized: ChatGPT login expired"``.
     :param kind: Classification, either ``"auth"`` or ``"generic"``.
     """
 
@@ -699,11 +702,11 @@ class _CodexTerminalError:
 
 def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     """
-    Classify a Codex ``turn.error`` as auth-related or generic.
+    Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
 
     Prefers the structured ``codexErrorInfo`` (``Unauthorized`` or an
     httpStatusCode of 401/403); falls back to substring matching against
-    :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions that omit it.
+    :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes that omit it.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -726,28 +729,50 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     return _CODEX_ERROR_KIND_GENERIC
 
 
-def _error_message_from_turn_error(error: dict[str, Any]) -> str:
+def _error_payload_message(payload: dict[str, Any]) -> str:
     """
-    Extract a non-empty message from a Codex ``turn.error`` object.
+    Extract a non-empty message from a Codex ``turn.error`` or ``error`` item.
 
-    :param error: The ``turn.error`` object, e.g.
-        ``{"message": "401 Unauthorized", "codexErrorInfo": "Unauthorized"}``.
-    :returns: Non-empty error text (a stable fallback when ``message`` is blank).
+    Both shapes have surfaced the text under a few keys across app-server
+    versions; reads the first non-empty one, falling back to a stable string
+    so the surfaced error is never blank.
+
+    :param payload: A ``turn.error`` object or an ``error`` ThreadItem.
+    :returns: Non-empty error text.
     """
-    message = error.get("message")
-    if isinstance(message, str) and message.strip():
-        return message.strip()
+    for key in ("message", "error", "text", "detail"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return "Codex turn ended with an unspecified error."
+
+
+def _error_item_from_turn(turn: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Return the first ``error`` ThreadItem in ``turn.items``, if any.
+
+    :param turn: A Codex turn object.
+    :returns: The first item whose ``type`` is :data:`_CODEX_ERROR_ITEM_TYPE`,
+        or ``None``.
+    """
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == _CODEX_ERROR_ITEM_TYPE:
+            return item
+    return None
 
 
 def _terminal_error_from_turn(params: dict[str, Any]) -> _CodexTerminalError | None:
     """
     Return the turn-level failure carried by a Codex turn, if any.
 
-    A failed turn carries ``turn.status == "failed"`` and a ``turn.error``
-    object (per the app-server protocol). This reads and classifies that
-    error and is the single source of truth reused by the live terminal edge
-    and the ``thread/resume`` parity path.
+    Prefers ``turn.error`` (the protocol's ``TurnError`` on a failed turn) and
+    falls back to an ``error`` ThreadItem in ``turn.items`` — both shapes exist
+    in the app-server type system and the wire shape varies by version. Single
+    source of truth reused by the live terminal edge and the ``thread/resume``
+    parity path.
 
     :param params: Codex turn params, e.g. a ``turn/completed`` payload or a
         single ``thread/resume`` turn wrapped as ``{"turn": <turn>}``.
@@ -757,11 +782,13 @@ def _terminal_error_from_turn(params: dict[str, Any]) -> _CodexTerminalError | N
     turn = params.get("turn")
     if not isinstance(turn, dict):
         return None
-    error = turn.get("error")
-    if not isinstance(error, dict):
+    payload = turn.get("error")
+    if not isinstance(payload, dict):
+        payload = _error_item_from_turn(turn)
+    if payload is None:
         return None
-    message = _error_message_from_turn_error(error)
-    return _CodexTerminalError(message=message, kind=_classify_codex_error(error, message))
+    message = _error_payload_message(payload)
+    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
 
 
 @dataclass(frozen=True)
@@ -3342,8 +3369,8 @@ def _terminal_turn_status_edge(
         source = f"{method}:recovered"
     else:
         source = method
-    # A failed turn carries ``turn.status == "failed"`` + ``turn.error`` even
-    # when Codex reports it via ``turn/completed`` ("silent success"). Force
+    # A failed turn carries ``turn.error`` (or an ``error`` item) even when
+    # Codex reports it via ``turn/completed`` ("silent success"). Force
     # ``failed`` and attach the error so the reason is surfaced downstream.
     error = _terminal_error_from_turn(params)
     if error is not None:

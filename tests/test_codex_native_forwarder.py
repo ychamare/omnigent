@@ -754,8 +754,50 @@ def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
     assert error.is_auth is True
 
 
+def test_terminal_error_from_turn_falls_back_to_error_item() -> None:
+    """With no ``turn.error``, an ``error`` ThreadItem in ``turn.items`` is used.
+
+    Both shapes exist in the app-server type system; the fallback keeps the fix
+    correct on the version/path that emits the error as an item rather than as a
+    ``turn.error`` object.
+    """
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [
+                {"type": "agentMessage", "id": "a", "text": "working"},
+                {"type": "error", "message": "please run codex login"},
+            ],
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.message == "please run codex login"
+    assert error.is_auth is True
+
+
+def test_terminal_error_from_turn_prefers_turn_error_over_item() -> None:
+    """``turn.error`` wins when both it and an ``error`` item are present."""
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": "from turn.error"},
+            "items": [{"type": "error", "message": "from item"}],
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.message == "from turn.error"
+
+
 def test_terminal_error_from_turn_none_for_clean_turn() -> None:
-    """A turn with no ``error`` object yields ``None`` (no false positives)."""
+    """A turn with no ``error`` object or item yields ``None`` (no false positives)."""
     params = {
         "turn": {
             "id": "turn_123",
@@ -765,6 +807,30 @@ def test_terminal_error_from_turn_none_for_clean_turn() -> None:
     }
 
     assert fwd._terminal_error_from_turn(params) is None
+
+
+def test_terminal_turn_status_edge_error_item_forces_failed(tmp_path: Path) -> None:
+    """A ``turn/completed`` carrying an ``error`` item (no ``turn.error``) fails.
+
+    The item-fallback path must flip the live edge to ``failed`` just like the
+    ``turn.error`` path does.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [{"type": "error", "message": "model stream broke"}],
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is not None
+    assert edge.error.message == "model stream broke"
+    assert edge.source == "turn/completed:turn-error"
 
 
 def test_terminal_turn_status_edge_turn_error_forces_failed(tmp_path: Path) -> None:
