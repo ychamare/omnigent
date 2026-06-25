@@ -125,6 +125,51 @@ function messageRole(message) {
   return String(message.role || message.type || "");
 }
 
+function toInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+/**
+ * Lift token usage out of one Pi assistant message.
+ *
+ * Mirrors the non-native executor's ``_extract_pi_turn_usage``
+ * (omnigent/inner/pi_executor.py): Pi (``@earendil-works/pi-coding-agent``)
+ * carries a per-message ``usage`` object with ``input`` / ``output`` /
+ * ``cacheRead`` / ``cacheWrite`` / ``totalTokens`` counts, and the message
+ * carries the resolved ``model``. Pi's ``input`` is the NON-cached input
+ * (Anthropic semantics) — ``cacheRead`` / ``cacheWrite`` are separate, so the
+ * full input a turn sent is ``input + cacheRead + cacheWrite``.
+ *
+ * @returns {{input:number,output:number,cacheRead:number,cacheWrite:number,
+ *   total:number,model:(string|null)}|null} the per-message counts, or
+ *   ``null`` when ``message`` is not an assistant message carrying usage.
+ */
+function extractPiUsage(message) {
+  if (!message || typeof message !== "object") return null;
+  if (message.role !== "assistant") return null;
+  const usage = message.usage;
+  if (!usage || typeof usage !== "object") return null;
+  const input = toInt(usage.input);
+  const output = toInt(usage.output);
+  const cacheRead = toInt(usage.cacheRead);
+  const cacheWrite = toInt(usage.cacheWrite);
+  // No countable tokens means Pi emitted an empty usage object — treat as "no
+  // usage" so the server leaves the session unpriced rather than recording a
+  // $0.00 turn (matches _aggregate_pi_turn_usage's empty-usage guard).
+  if (!(input || output || cacheRead || cacheWrite)) return null;
+  const rawModel = message.model;
+  const model = typeof rawModel === "string" && rawModel ? rawModel : null;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    total: toInt(usage.totalTokens),
+    model,
+  };
+}
+
 function headers(config) {
   return {
     "content-type": "application/json",
@@ -324,6 +369,77 @@ module.exports = function (pi) {
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
 
+  // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
+  // assistant message per LLM call); session billing is their SUM — each call
+  // is billed for the full context it re-sent, so summing per-message inputs is
+  // the correct cumulative input. The server applies vendor pricing to these
+  // cumulative totals and republishes a ``session.usage`` event (the SAME
+  // contract claude-native / codex-native / cursor-native use), so the web
+  // Session-cost badge + per-model token breakdown light up with no
+  // server/frontend changes. Dedup by message fingerprint so a re-emitted
+  // ``message_end`` / ``turn_end`` / ``agent_end`` carrying the same assistant
+  // message never double-counts. ``usageModel`` tracks the latest message's
+  // model (mirrors a mid-session model switch). ``lastPostedUsageKey`` dedups
+  // the POST itself so a flush with no new tokens is skipped.
+  const countedUsageMessages = new Set();
+  let cumulativeInputTokens = 0;
+  let cumulativeOutputTokens = 0;
+  let cumulativeCacheReadTokens = 0;
+  let usageModel = null;
+  let lastPostedUsageKey = "";
+
+  // Build a stable fingerprint for one assistant message so the same message
+  // arriving on multiple lifecycle events is only counted once. Prefer Pi's
+  // own message id; fall back to hashing the usage counts + model.
+  function usageMessageKey(message, usage) {
+    const id =
+      message && typeof message === "object" && typeof message.id === "string"
+        ? message.id
+        : "";
+    if (id) return `id:${id}`;
+    return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.model || ""}`;
+  }
+
+  // Fold one assistant message's usage into the cumulative session totals,
+  // deduped by fingerprint. Returns true when it counted (totals advanced).
+  function accumulateUsage(message) {
+    const usage = extractPiUsage(message);
+    if (!usage) return false;
+    const key = usageMessageKey(message, usage);
+    if (countedUsageMessages.has(key)) return false;
+    countedUsageMessages.add(key);
+    // The server's ``cumulative_input_tokens`` is INCLUSIVE of cache reads (it
+    // splits the cache portion back out and prices it at the cache-read rate),
+    // so add cacheRead into the input total. ``cacheWrite`` (cache creation)
+    // has no dedicated cumulative field on the server, so fold it into the
+    // input total too — it is then priced at the input rate rather than the
+    // ~1.25x cache-write rate, a small, documented approximation that never
+    // drops the tokens.
+    cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
+    cumulativeOutputTokens += usage.output;
+    cumulativeCacheReadTokens += usage.cacheRead;
+    if (usage.model) usageModel = usage.model;
+    return true;
+  }
+
+  // POST the cumulative session usage so the server prices it and publishes a
+  // ``session.usage`` event. Cumulative (SET) semantics — the server overwrites
+  // its stored totals each flush. Deduped so a flush with no advance is a
+  // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
+  async function postSessionUsage() {
+    if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
+    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    if (postKey === lastPostedUsageKey) return;
+    lastPostedUsageKey = postKey;
+    const data = {
+      cumulative_input_tokens: cumulativeInputTokens,
+      cumulative_output_tokens: cumulativeOutputTokens,
+      cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+    };
+    if (usageModel) data.model = usageModel;
+    await postEvent(config, { type: "external_session_usage", data });
+  }
+
   function rememberContext(ctx) {
     if (ctx) latestContext = ctx;
   }
@@ -517,12 +633,24 @@ module.exports = function (pi) {
     });
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     rememberContext(ctx);
     clearPendingInterrupt();
     agentRunning = false;
     setOmnigentStatus(config, ctx, "idle");
     activeResponseId = null;
+    // Last-chance usage capture from the agent loop's final message set, in
+    // case neither ``message_end`` nor ``turn_end`` carried usage for some
+    // call. ``event.messages`` may hold the whole conversation; the
+    // fingerprint dedup means re-scanning already-counted messages is a no-op,
+    // so a plain forward-scan is safe (no overcount).
+    const messages =
+      event && Array.isArray(event.messages) ? event.messages : [];
+    let changed = false;
+    for (const message of messages) {
+      if (accumulateUsage(message)) changed = true;
+    }
+    if (changed) await postSessionUsage();
     await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
@@ -630,6 +758,10 @@ module.exports = function (pi) {
     if (role !== "assistant") return;
     const responseId = currentResponseId();
     await mirrorAssistantMessage(message, responseId);
+    // ``message_end`` is the primary usage-capture site (one completed
+    // assistant message per LLM call); fold its token counts into the
+    // cumulative session totals and flush to the server for pricing.
+    if (accumulateUsage(message)) await postSessionUsage();
     const text = textFromMessage(message);
     if (!text) return;
     await postEvent(config, {
@@ -651,6 +783,11 @@ module.exports = function (pi) {
     replayPendingInterrupt(ctx);
     const responseId = currentResponseId();
     await mirrorAssistantMessage(event && event.message, responseId);
+    // Fallback usage capture: if Pi attached usage to the turn's final
+    // assistant message but no ``message_end`` carried it, fold it in here.
+    // Deduped by fingerprint, so a message already counted on ``message_end``
+    // is a no-op.
+    if (accumulateUsage(event && event.message)) await postSessionUsage();
     const results =
       event && Array.isArray(event.toolResults) ? event.toolResults : [];
     for (const result of results) {
