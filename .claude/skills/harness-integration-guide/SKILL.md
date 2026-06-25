@@ -117,15 +117,14 @@ All capabilities are **required** for a complete harness integration:
 ## Part 2 — Native harnesses
 
 Native harnesses wrap a vendor's own TUI or server and mirror output into
-Omnigent. They connect to the Omnigent MCP server via `stdio serve-mcp`
-and relay the vendor's conversation into the Omnigent session.
+Omnigent. They relay the vendor's conversation into the Omnigent session.
 
 ### Capability matrix
 
 | Capability | What it means |
 |---|---|
 | **Transport** | How the native harness communicates — tmux TUI, app server, HTTP/SSE, file-inject TUI |
-| **Connects to Omnigent MCP** | Whether the native harness connects via `stdio serve-mcp` |
+| **Connects to Omnigent MCP** | Whether the native harness connects to the Omnigent MCP server |
 | **Model override** | User can select a model at launch or per-prompt |
 | **Auth** | Vendor login / config / token |
 | **Streaming (forwarder)** | `deltas` (token-level) vs `complete-only` (full response after completion) |
@@ -144,7 +143,7 @@ and relay the vendor's conversation into the Omnigent session.
 All capabilities are **required** for a complete native harness integration:
 
 - [ ] Transport chosen and implemented (tmux TUI, app server, HTTP/SSE)
-- [ ] Connects to Omnigent MCP via `stdio serve-mcp`
+- [ ] Connects to Omnigent MCP
 - [ ] Model override works (or document vendor lock-in)
 - [ ] Auth configured (vendor login / config)
 - [ ] Streaming forwarder works (deltas preferred; complete-only acceptable)
