@@ -1033,6 +1033,7 @@ def build_codex_native_server(
     python_executable: str | None = None,
     codex_path: str | None = None,
     extra_config_overrides: list[str] | None = None,
+    bypass_sandbox: bool = False,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -1057,6 +1058,14 @@ def build_codex_native_server(
     :param extra_config_overrides: Additional ``-c`` config overrides
         appended after Databricks routing overrides, e.g. MCP server
         registration for the Omnigent tool relay.
+    :param bypass_sandbox: When ``True``, append config overrides that put
+        the app-server's threads into the full-bypass stance
+        (``approval_policy="never"`` + ``sandbox_mode="danger-full-access"``)
+        so the chat/forwarder seam matches the ``--remote`` TUI launched
+        with ``--dangerously-bypass-approvals-and-sandbox``. DANGEROUS:
+        disables both approval prompts and the command sandbox; gated
+        behind an explicit, typed-confirmation opt-in in the web UI.
+        Default ``False``. See issue #657.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -1087,6 +1096,17 @@ def build_codex_native_server(
         env["DATABRICKS_HOST"] = host
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
+    if bypass_sandbox:
+        # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
+        # on the app-server threads: never prompt for approval, and run
+        # commands with no command sandbox. Emitted last so it wins over any
+        # earlier approval/sandbox override.
+        config_overrides.extend(
+            [
+                'approval_policy="never"',
+                'sandbox_mode="danger-full-access"',
+            ]
+        )
     return CodexNativeAppServer(
         codex_path=resolved_codex,
         socket_path=socket_path,
@@ -1508,12 +1528,62 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     }
 
 
+# Codex's full-bypass flag. Disables BOTH the approval prompts and the
+# command sandbox in one switch. It is mutually exclusive with the
+# granular ``--sandbox`` / ``--ask-for-approval`` flags: codex aborts at
+# startup if the bypass flag is combined with either, so when bypass is on
+# the conflicting flags must be stripped from the pass-through args. See
+# issue #657.
+_CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+# Granular approval/sandbox flags (the "Full access" / "Read only" approval
+# presets emit these as ``--flag value`` pairs — see ap-web
+# CODEX_NATIVE_APPROVAL_MODES) that conflict with the bypass flag and must
+# be dropped, together with their following value, when bypass is enabled.
+_CODEX_APPROVAL_SANDBOX_FLAGS = frozenset({"--sandbox", "--ask-for-approval"})
+
+
+def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
+    """
+    Drop granular ``--sandbox`` / ``--ask-for-approval`` flag pairs.
+
+    Used when the full-bypass flag is enabled: codex rejects the bypass
+    flag when it is combined with either granular flag, so each such flag
+    is removed together with its immediately following value. Any
+    already-present bypass flag is also dropped so the caller can re-add a
+    single canonical copy. Unrelated args (model, config overrides, ...)
+    pass through untouched.
+
+    :param codex_args: Raw Codex CLI args, e.g.
+        ``("--sandbox", "read-only", "--model", "gpt-5.4-mini")``.
+    :returns: ``codex_args`` with the conflicting flag pairs removed, e.g.
+        ``["--model", "gpt-5.4-mini"]``.
+    """
+    cleaned: list[str] = []
+    skip_next = False
+    for arg in codex_args:
+        if skip_next:
+            # This is the value belonging to a stripped flag.
+            skip_next = False
+            continue
+        if arg in _CODEX_APPROVAL_SANDBOX_FLAGS:
+            # Drop the flag and its following value (a ``--flag value`` pair).
+            skip_next = True
+            continue
+        if arg == _CODEX_BYPASS_SANDBOX_FLAG:
+            # Drop any pre-existing bypass flag; a single canonical copy is
+            # re-added by the caller so it is never duplicated.
+            continue
+        cleaned.append(arg)
+    return cleaned
+
+
 def build_codex_remote_args(
     *,
     codex_args: tuple[str, ...],
     thread_id: str | None,
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
+    bypass_sandbox: bool = False,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -1555,14 +1625,28 @@ def build_codex_remote_args(
         ``('model="databricks-gpt-5-5"', 'model_provider="omnigent_databricks"')``.
         Each is emitted as a ``-c <value>`` global flag. Empty for a
         plain Codex-login launch that needs no provider routing.
+    :param bypass_sandbox: When ``True``, emit a single
+        ``--dangerously-bypass-approvals-and-sandbox`` flag and strip any
+        conflicting ``--sandbox`` / ``--ask-for-approval`` pairs from
+        *codex_args* (codex aborts at startup if the bypass flag is
+        combined with either). DANGEROUS: this disables both the approval
+        prompts and the command sandbox; it is gated behind an explicit,
+        typed-confirmation opt-in in the web UI. Default ``False`` keeps
+        the granular flags untouched. See issue #657.
     :returns: Codex argv tail after the executable.
     """
     override_args: list[str] = []
     for override in config_overrides:
         override_args.extend(["-c", override])
+    if bypass_sandbox:
+        # Strip the conflicting granular flags, then prepend one canonical
+        # bypass flag (a global flag, so it precedes any ``resume``).
+        passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
+    else:
+        passthrough = list(codex_args)
     if thread_id is None:
-        return [*override_args, *codex_args, "--remote", remote_url]
-    return [*override_args, *codex_args, "resume", "--remote", remote_url, thread_id]
+        return [*override_args, *passthrough, "--remote", remote_url]
+    return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
 
 
 def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:

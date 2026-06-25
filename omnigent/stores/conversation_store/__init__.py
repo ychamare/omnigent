@@ -61,6 +61,19 @@ FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 # so it survives across turns and is overwritten by each subsequent switch.
 SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 
+# Opt-in DANGEROUS launch directive for a codex-native session: when set to
+# ``"1"`` the runner launches Codex with
+# ``--dangerously-bypass-approvals-and-sandbox`` and puts the app-server
+# threads into the matching no-approval / no-sandbox stance (see
+# ``omnigent.runner.app._codex_native_launch_config`` and
+# ``codex_native_app_server.build_codex_remote_args``). Stored as a plain
+# conversation label (cheap thread metadata, like the fork directives above)
+# so it survives reload without a schema migration. The web UI gates turning
+# this on behind a typed confirmation + a persistent red warning banner; any
+# value other than ``"1"`` (incl. absent) leaves the session in Codex's
+# normal approval/sandbox stance. See issue #657.
+CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
+
 # Labels scoped to one running session instance — deliberately NOT copied
 # when forking. A fork is an independent session that re-binds its own
 # runtime, so inheriting these would point the clone at the SOURCE's
