@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -212,8 +213,7 @@ _TAGS: list[dict[str, str]] = [
         "name": "hosts",
         "x-displayName": "Hosts",
         "description": (
-            "Hosts that can launch runners. Browse the host filesystem "
-            "and create directories."
+            "Hosts that can launch runners. Browse the host filesystem and create directories."
         ),
     },
     {
@@ -225,8 +225,7 @@ _TAGS: list[dict[str, str]] = [
         "name": "session_policies",
         "x-displayName": "Session Policies",
         "description": (
-            "Contextual policies scoped to a single session — list, "
-            "create, update, and remove."
+            "Contextual policies scoped to a single session — list, create, update, and remove."
         ),
     },
     {
@@ -243,8 +242,7 @@ _TAGS: list[dict[str, str]] = [
         "name": "comments",
         "x-displayName": "Comments",
         "description": (
-            "Threaded comments on a session, including sending a comment "
-            "to the agent."
+            "Threaded comments on a session, including sending a comment to the agent."
         ),
     },
     {
@@ -436,13 +434,161 @@ def _retag_session_resources(paths: dict[str, Any]) -> None:
                 op["tags"] = ["session_resources"]
 
 
+# ── reStructuredText docstring → Markdown ─────────────────────────
+#
+# FastAPI uses each route handler's docstring verbatim as the OpenAPI
+# operation ``description``. Our docstrings are Sphinx/reST: ``:param
+# name:`` / ``:returns:`` / ``:raises Exc:`` field lists and inline
+# ``:class:`Foo``` cross-reference roles. Docs renderers (Scalar) treat
+# the description as Markdown, so reST field lists collapse into one
+# unreadable run of literal text. We convert that markup to Markdown:
+#
+#   * each ``:param name:`` whose name matches a real query/path
+#     parameter is moved onto that parameter's ``description`` (so it
+#     renders inline in the parameter table, not in the prose blob);
+#   * request-body / form ``:param`` entries that have no matching
+#     parameter become a Markdown ``**Parameters**`` bullet list;
+#   * ``:returns:`` becomes a ``**Returns:**`` line, ``:raises:`` a
+#     ``**Raises**`` bullet list;
+#   * framework-internal params (``request``/``response``/…) are dropped;
+#   * inline ``:role:`X``` roles collapse to `` `X` `` and reST double
+#     backticks (`` ``X`` ``) normalize to Markdown single backticks.
+
+# Field-list line markers (matched at column 0; continuation lines are
+# indented and accumulate onto the field opened above them).
+_RST_PARAM = re.compile(r"^:(?:param|parameter|arg|argument|keyword|kwarg)\s+(\S+)\s*:\s*(.*)$")
+_RST_RETURNS = re.compile(r"^:returns?\s*:\s*(.*)$")
+_RST_RAISES = re.compile(r"^:raises?\s+([^:]+?)\s*:\s*(.*)$")
+# Any other reST field marker (``:rtype:``, ``:type x:``, …) — dropped.
+_RST_OTHER_FIELD = re.compile(r"^:[a-zA-Z][\w ]*:")
+# Inline cross-reference role, e.g. ``:class:`Foo``` → `` `Foo` ``.
+_RST_ROLE = re.compile(r":[a-zA-Z]+:`([^`]+)`")
+# reST inline literal (double backtick) → Markdown code span (single).
+_RST_DOUBLE_BACKTICK = re.compile(r"``([^`]+)``")
+
+# Handler parameters that are FastAPI plumbing, not API inputs.
+_INTERNAL_PARAMS = frozenset(
+    {"request", "response", "websocket", "ws", "background_tasks", "bg", "_", "args", "kwargs"},
+)
+
+
+def _rst_inline_to_md(text: str) -> str:
+    """Convert inline reST roles / literals in *text* to Markdown."""
+    text = _RST_ROLE.sub(r"`\1`", text)
+    return _RST_DOUBLE_BACKTICK.sub(r"`\1`", text)
+
+
+def _rst_field_text(lines: list[str]) -> str:
+    """Join a field's (possibly multi-line) body into one Markdown string."""
+    joined = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    return _rst_inline_to_md(joined)
+
+
+def _reformat_operation_doc(op: dict[str, Any]) -> None:
+    """
+    Rewrite one operation's reST ``description`` as Markdown in place.
+
+    Matched ``:param:`` entries are moved onto ``op['parameters']``;
+    the remaining prose / body-params / returns / raises are rebuilt as
+    a Markdown description. No-op if there is no description.
+
+    :param op: An OpenAPI operation object; mutated in place.
+    """
+    desc = op.get("description")
+    if not desc:
+        return
+
+    # Split the docstring into leading prose and reST fields. ``cur``
+    # is the field currently accumulating continuation lines.
+    prose: list[str] = []
+    fields: list[tuple[str, str | None, list[str]]] = []
+    cur: tuple[str, str | None, list[str]] | None = None
+    in_fields = False
+    for line in desc.split("\n"):
+        param_m = _RST_PARAM.match(line)
+        if param_m:
+            in_fields = True
+            cur = ("param", param_m.group(1).strip().lstrip("*"), [param_m.group(2)])
+            fields.append(cur)
+            continue
+        returns_m = _RST_RETURNS.match(line)
+        if returns_m:
+            in_fields = True
+            cur = ("returns", None, [returns_m.group(1)])
+            fields.append(cur)
+            continue
+        raises_m = _RST_RAISES.match(line)
+        if raises_m:
+            in_fields = True
+            cur = ("raises", raises_m.group(1).strip(), [raises_m.group(2)])
+            fields.append(cur)
+            continue
+        if in_fields and _RST_OTHER_FIELD.match(line):
+            cur = ("drop", None, [])  # unknown field (e.g. :rtype:) — discard
+            fields.append(cur)
+            continue
+        if in_fields:
+            if cur is not None:
+                cur[2].append(line)
+        else:
+            prose.append(line)
+
+    param_names = {p.get("name") for p in op.get("parameters", [])}
+    body_params: list[tuple[str, str]] = []
+    raises: list[tuple[str, str]] = []
+    returns: str | None = None
+    for kind, name, body_lines in fields:
+        text = _rst_field_text(body_lines)
+        if kind == "param":
+            if not text or name in _INTERNAL_PARAMS:
+                continue
+            if name in param_names:
+                # Move onto the matching parameter (don't clobber an
+                # explicit Query(description=...) if one exists).
+                for param in op["parameters"]:
+                    if param.get("name") == name and not param.get("description"):
+                        param["description"] = text
+                        break
+            else:
+                body_params.append((name or "", text))
+        elif kind == "raises" and text:
+            raises.append((name or "", text))
+        elif kind == "returns" and text:
+            returns = text
+
+    sections: list[str] = []
+    prose_md = _rst_inline_to_md("\n".join(prose).strip())
+    if prose_md:
+        sections.append(prose_md)
+    if body_params:
+        sections.append(
+            "**Parameters**\n\n" + "\n".join(f"- `{name}` — {text}" for name, text in body_params),
+        )
+    if returns:
+        sections.append(f"**Returns:** {returns}")
+    if raises:
+        sections.append(
+            "**Raises**\n\n" + "\n".join(f"- `{exc}` — {text}" for exc, text in raises),
+        )
+    op["description"] = "\n\n".join(sections)
+
+
+def _reformat_descriptions(paths: dict[str, Any]) -> None:
+    """Convert every operation's reST description to Markdown in place."""
+    for methods in paths.values():
+        for method, op in methods.items():
+            if method in _HTTP_METHODS and isinstance(op, dict):
+                _reformat_operation_doc(op)
+
+
 def _enrich_spec(spec: dict[str, Any]) -> None:
     """
     Inject document-level metadata for docs / SDK tooling.
 
     Adds ``info.description``, ``servers``, top-level ``tags`` with
     human-readable descriptions, and ``components.securitySchemes`` —
-    none of which FastAPI emits — and tags the untagged utility routes.
+    none of which FastAPI emits — tags the untagged utility routes, and
+    rewrites reST operation docstrings as Markdown.
     Mutates ``spec`` in place. See the module-level enrichment
     constants for the rationale behind each value.
 
@@ -459,6 +605,7 @@ def _enrich_spec(spec: dict[str, Any]) -> None:
     paths = spec.setdefault("paths", {})
     _tag_system_routes(paths)
     _retag_session_resources(paths)
+    _reformat_descriptions(paths)
 
 
 def generate_spec() -> dict[str, Any]:
