@@ -667,3 +667,58 @@ async def test_elicitation_post_returns_none_when_budget_exhausted(
     # 1 = the deadline check stopped the loop before a second attempt
     # (backoff 1.0s > 0.5s budget); more means the budget is ignored.
     assert len(client.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_status_posts_and_dedupes_consecutive() -> None:
+    """
+    Compaction status mirrors as external_compaction_status, deduped (#1255).
+
+    Codex may signal completion via both a ``contextCompaction`` item and a
+    ``thread/compacted`` notification; consecutive identical statuses must
+    not double-post (the spinner would flicker).
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._post_compaction_status(client, "conv_x", "in_progress", forwarder_state=state)
+    await fwd._post_compaction_status(client, "conv_x", "completed", forwarder_state=state)
+    # Duplicate completion (e.g. item then notification) is suppressed.
+    await fwd._post_compaction_status(client, "conv_x", "completed", forwarder_state=state)
+
+    assert [post[1] for post in client.posts] == [
+        {"type": "external_compaction_status", "data": {"status": "in_progress"}},
+        {"type": "external_compaction_status", "data": {"status": "completed"}},
+    ]
+    assert state.compaction_status_posted == "completed"
+
+
+@pytest.mark.asyncio
+async def test_completed_context_compaction_item_clears_spinner() -> None:
+    """
+    A completed ``contextCompaction`` item posts compaction-completed.
+
+    It is a status edge, not transcript history, so it must clear the
+    spinner without being appended as a conversation item.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.compaction_status_posted = "in_progress"
+
+    await fwd._handle_completed_item(
+        client,
+        "conv_x",
+        {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {"type": "contextCompaction", "id": "item_c"},
+        },
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {"type": "external_compaction_status", "data": {"status": "completed"}},
+        )
+    ]
