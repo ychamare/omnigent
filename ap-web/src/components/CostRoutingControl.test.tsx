@@ -105,21 +105,16 @@ describe("parseCostRoutingVerdict", () => {
 });
 
 describe("isCostRoutingSession", () => {
-  it("matches a top-level polly session (the orchestrator)", () => {
+  it("matches any top-level session with an agent name", () => {
     expect(isCostRoutingSession({ agentName: "polly", parentSessionId: null })).toBe(true);
+    expect(isCostRoutingSession({ agentName: "debby", parentSessionId: null })).toBe(true);
+    expect(isCostRoutingSession({ agentName: "my-agent", parentSessionId: null })).toBe(true);
   });
 
-  it("rejects a polly child session — workers inherit the parent's agentName", () => {
-    // The exact bug: claude_code/codex/pi children spawned via
-    // sys_session_send snapshot with agentName "polly", so a bare
-    // name check renders the control inside the child chat.
+  it("rejects a child session — workers inherit the parent's agentName", () => {
     expect(isCostRoutingSession({ agentName: "polly", parentSessionId: "conv_parent987" })).toBe(
       false,
     );
-  });
-
-  it("rejects other agents, top-level and child alike", () => {
-    expect(isCostRoutingSession({ agentName: "debby", parentSessionId: null })).toBe(false);
     expect(isCostRoutingSession({ agentName: "debby", parentSessionId: "conv_parent987" })).toBe(
       false,
     );

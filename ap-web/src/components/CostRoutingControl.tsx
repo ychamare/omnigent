@@ -7,28 +7,23 @@ import type { Session } from "@/lib/types";
 /** Per-session cost-control switch value; `null` = unset (presents as off). */
 export type CostControlMode = "on" | "off" | null;
 
-/** Agent whose sessions carry the cost advisor (orchestrator only). */
-export const COST_ROUTING_AGENT_NAME = "polly";
-
 /**
- * Whether a session should surface the cost-routing control.
+ * Whether a session should surface the smart-routing control.
  *
- * The advisor governs only the orchestrator's own brain, so the gate
- * must exclude sub-agent (child) sessions: workers spawned via
- * `sys_session_send` inherit the parent bundle's `agentName`
- * (`"polly"`), so an agent-name check alone wrongly matches them.
- * `parentSessionId` — set on every child snapshot, `null` for
- * top-level sessions — is the discriminator.
+ * Smart routing is a server-side feature available to any top-level
+ * session (not sub-agents).  Sub-agent (child) sessions are excluded:
+ * workers spawned via `sys_session_send` inherit the parent's
+ * `agentName`, so `parentSessionId` is the discriminator.
  *
  * @param session The session snapshot (or any subset carrying agent
  *   identity + parent linkage); `null`/`undefined` while loading or
  *   on the landing page.
- * @returns `true` only for a top-level (non-child) polly session.
+ * @returns `true` for any top-level (non-child) session with an agent.
  */
 export function isCostRoutingSession(
   session: Pick<Session, "agentName" | "parentSessionId"> | null | undefined,
 ): boolean {
-  return session?.agentName === COST_ROUTING_AGENT_NAME && session.parentSessionId == null;
+  return session?.agentName != null && session.parentSessionId == null;
 }
 
 /** Conversation label the cost advisor persists its latest plan under. */

@@ -492,7 +492,7 @@ describe("AgentInfoButton intelligent routing section", () => {
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
   }
 
-  it("hides the section for a non-routing agent with no recorded decision", () => {
+  it("shows routing section for any top-level agent (not polly-specific)", () => {
     renderButtonWithSession(
       AGENT_WITH_BOTH,
       "conv_r1",
@@ -500,9 +500,9 @@ describe("AgentInfoButton intelligent routing section", () => {
       true,
     );
     openInfo();
-    // The popover itself opened (agent name renders) — only the section is absent.
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
-    expect(screen.queryByTestId("intelligent-routing-section")).toBeNull();
+    // Any top-level agent now shows the routing section (server-side routing).
+    expect(screen.getByTestId("intelligent-routing-section")).toBeInTheDocument();
   });
 
   it("shows On plus the quiet no-decision line before the first verdict", () => {

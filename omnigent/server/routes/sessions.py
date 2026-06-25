@@ -7795,6 +7795,87 @@ async def _persist_session_event(
     return item_id
 
 
+def _extract_user_text_for_routing(body: SessionEventInput) -> str:
+    """Extract plain text from a user message event for the routing judge.
+
+    Concatenates all ``input_text`` blocks in ``body.data["content"]``,
+    returning the first 4 000 characters.  Returns ``""`` for non-message
+    events or events with no text content.
+    """
+    content = body.data.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "input_text":
+            text = block.get("text", "")
+            if isinstance(text, str):
+                parts.append(text)
+    return " ".join(parts)[:4000]
+
+
+async def _emit_server_routing_decision(
+    session_id: str,
+    conversation_store: ConversationStore,
+    model: str,
+    verdict: dict[str, Any],
+) -> None:
+    """Persist and publish a ``routing_decision`` transcript chip.
+
+    Called by the server-side routing path before the turn is forwarded
+    to the runner.  The chip shows the judge's model pick at turn start
+    — the same UX the runner-side advisor produced, but driven entirely
+    by the server.
+    """
+    import uuid
+
+    from omnigent.runtime import session_stream
+
+    tier = verdict.get("tier", "medium")
+    rationale = verdict.get("rationale", "")
+    item_data = {
+        "model": model,
+        "tier": tier if tier in ("cheap", "medium", "expensive") else "medium",
+        "applied": True,
+        "rationale": rationale if isinstance(rationale, str) else "",
+    }
+    try:
+        parsed_data = parse_item_data("routing_decision", item_data)
+    except (ValueError, TypeError):
+        _logger.warning("Server routing: failed to parse routing_decision data")
+        return
+
+    routing_item = NewConversationItem(
+        type="routing_decision",
+        response_id=f"routing_{uuid.uuid4().hex}",
+        data=parsed_data,
+    )
+    try:
+        persisted = await asyncio.to_thread(
+            conversation_store.append, session_id, [routing_item]
+        )
+        persisted_id: str | None = persisted[0].id if persisted else None
+    except Exception:
+        _logger.exception(
+            "Server routing: routing_decision persist failed for session=%s",
+            session_id,
+        )
+        persisted_id = None
+
+    # Publish live event so the web UI renders the chip immediately.
+    session_stream.publish(
+        session_id,
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "id": persisted_id,
+                "type": "routing_decision",
+                **item_data,
+            },
+        },
+    )
+
+
 async def _forward_event_to_runner(
     session_id: str,
     conv: Conversation,
@@ -7934,6 +8015,33 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # ── Server-side intelligent routing ──────────────────────────────
+    # When the session toggle is ON and no explicit model override is
+    # set, call the lightweight judge LLM to pick the best model for
+    # this turn.  The verdict is applied as model_override so the
+    # runner sees a concrete model — no per-agent config needed.
+    if (
+        effective_runner_override is None
+        and conv.cost_control_mode_override == "on"
+        and body.type == "message"
+    ):
+        from omnigent.server.smart_routing import route_turn
+
+        _harness = _resolve_harness(conv)
+        _user_text = _extract_user_text_for_routing(body)
+        if _user_text:
+            _routed_model, _verdict = await route_turn(_harness, _user_text)
+            if _routed_model is not None:
+                effective_runner_override = _routed_model
+                # Emit the routing_decision transcript chip so the UI
+                # shows which model was picked, before the turn output.
+                await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _routed_model,
+                    _verdict or {},
+                )
+    # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no

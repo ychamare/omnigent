@@ -1199,11 +1199,9 @@ export function NewChatLandingScreen() {
               : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
                 ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
                 : undefined,
-          // Cost-control switch from the "Cost Optimized" pill; polly-only
-          // (cost control is a polly feature) and omitted when unset so the
-          // session defers to the spec default.
-          cost_control_mode_override:
-            agent?.name === "polly" ? (costControlMode ?? undefined) : undefined,
+          // Smart routing toggle — server-side, available for any agent.
+          // Omitted when unset so the session defers to off.
+          cost_control_mode_override: costControlMode ?? undefined,
           // Brain-harness pick from the agent flyout. Omitted when the user
           // kept the spec default (pickedHarness is null) so the session
           // tracks the agent's declared harness.
@@ -1479,9 +1477,8 @@ export function NewChatLandingScreen() {
                 />
               </div>
               <div className="flex items-center gap-0.5">
-                {/* Polly-only surface — cost control is a polly feature, so
-                    the toggle is hidden unless the selected agent is polly. */}
-                {selectedAgent?.name === "polly" && (
+                {/* Smart routing toggle — available for any agent. */}
+                {selectedAgent && (
                   // Mode-only variant: no verdict can exist before the session does.
                   <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
                 )}
