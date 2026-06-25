@@ -153,6 +153,28 @@ Compact/fork/resume are covered by §1/§4/§5.
 - TUI coexistence: if the TUI is attached, answering the approval there should
   resolve the web card too (terminal-resolved race guard — first-answer-wins).
 
+### 7a. Cost-budget enforcement  [needs web: budget + live turns]
+
+opencode has no pre-tool hook (unlike claude-native), so the cost budget is
+enforced **reactively** through the same policy engine: `permission:"ask"` makes
+every tool call emit `permission.asked` → the forwarder POSTs a `PHASE_TOOL_CALL`
+to `/policies/evaluate` → the cost-budget gate reads the session cost (from the
+`external_session_usage` cost tracking, `cumulative_cost_usd` →
+`total_cost_usd`). This is the codex-native model.
+- Preconditions: set a **small per-session cost budget** on an opencode-native
+  session (low enough to trip within a couple of turns).
+- Steps: run turns until cumulative cost crosses the budget, then have the model
+  attempt another tool call.
+- Expected:
+  - On the crossing, the next gated tool call surfaces the **cost-budget
+    approval card** (ASK) and **blocks** opencode's tool until resolved — or, for
+    a hard cap, **denies** it. (opencode genuinely waits on the permission reply.)
+  - The cost the gate sees matches the web cost badge (both from
+    `external_session_usage`).
+  - Known limitation to confirm, not flag as a bug: enforcement can lag the
+    in-flight turn by one message (the turn's cost posts on completion), same as
+    claude/codex.
+
 ---
 
 ## 8. question.asked interactive input (foundation only)  [needs web: round-trip]
