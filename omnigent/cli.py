@@ -9124,6 +9124,9 @@ class _HarnessMenuRow:
     provider: str | None = None
 
 
+_SOFT_INSTALL_ABORT = "\x00soft-install-abort"
+
+
 def _credential_label(name: str, entry: ProviderEntry) -> str:
     """A friendly, jargon-free label for a configured credential.
 
@@ -9334,10 +9337,12 @@ def _prompt_install_cursor() -> str | None:
             return "✓ cursor-sdk installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the key anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
     if choice == 2:  # run it yourself
         console.print(f"  Install the cursor extra with:\n    [bold]{cmd_markup}[/bold]")
         return None
-    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    # choice == 1 (set key anyway): fall through to the key menu silently.
     return None
 
 
@@ -9375,6 +9380,8 @@ def _manage_cursor_harness() -> None:
     status: str | None = None
     if not cursor_sdk_installed():
         status = _prompt_install_cursor()
+        if status == _SOFT_INSTALL_ABORT:
+            return
     while True:
         config = _load_global_config()
         key_set = cursor_api_key_configured(config)
@@ -9504,10 +9511,12 @@ def _prompt_install_antigravity() -> str | None:
             return "✓ google-antigravity installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the key anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
     if choice == 2:
         console.print(f"  Install the antigravity extra with:\n    [bold]{cmd_markup}[/bold]")
         return None
-    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    # choice == 1 (set key anyway): fall through to the key menu silently.
     return None
 
 
@@ -9541,6 +9550,8 @@ def _manage_antigravity_harness() -> None:
     status: str | None = None
     if not antigravity_sdk_installed():
         status = _prompt_install_antigravity()
+        if status == _SOFT_INSTALL_ABORT:
+            return
     while True:
         config = _load_global_config()
         key_set = antigravity_api_key_configured(config)
@@ -10183,10 +10194,12 @@ def _prompt_install_copilot() -> str | None:
             return "✓ github-copilot-sdk installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the token anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
     if choice == 2:  # run it yourself
         console.print(f"  Install the copilot extra with:\n    [bold]{cmd_markup}[/bold]")
         return None
-    # choice == 1 (set token anyway) or Esc: fall through to the token menu silently.
+    # choice == 1 (set token anyway): fall through to the token menu silently.
     return None
 
 
@@ -10226,6 +10239,8 @@ def _manage_copilot_harness() -> None:
     status: str | None = None
     if not copilot_sdk_installed():
         status = _prompt_install_copilot()
+        if status == _SOFT_INSTALL_ABORT:
+            return
     while True:
         config = _load_global_config()
         token_set = copilot_github_token_configured(config)

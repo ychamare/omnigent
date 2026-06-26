@@ -2753,6 +2753,40 @@ def test_copilot_overview_install_command_is_selection_only(
     assert "pip install" not in Text.from_markup(options[copilot]).plain
 
 
+@pytest.mark.parametrize(
+    "choice,sdk_probe,unexpected_header",
+    [
+        ("3", "omnigent.onboarding.cursor_auth.cursor_sdk_installed", "Cursor — no API key yet"),
+        (
+            "7",
+            "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
+            "Antigravity — no Gemini API key yet",
+        ),
+        (
+            "10",
+            "omnigent.onboarding.copilot_auth.copilot_sdk_installed",
+            "Copilot — no GitHub token yet",
+        ),
+    ],
+)
+def test_soft_sdk_install_prompt_abort_returns_to_overview(
+    isolated_config, monkeypatch, choice: str, sdk_probe: str, unexpected_header: str
+) -> None:
+    """Esc/q on a soft-SDK install prompt backs out instead of entering key setup.
+
+    Cursor, Antigravity, and Copilot can store their key/token even when the SDK
+    extra is absent, but that should happen only when the user explicitly picks
+    "Set ... anyway". Aborting the install offer should return to the harness
+    overview, matching the other setup drill-ins' Esc behavior.
+    """
+    monkeypatch.setattr(sdk_probe, lambda: False)
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\nq\n")
+
+    assert result.exit_code == 0, result.output
+    assert unexpected_header not in result.output
+
+
 def test_antigravity_drillin_offers_install_when_sdk_missing(
     isolated_config, _antigravity_sdk_absent
 ) -> None:
