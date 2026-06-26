@@ -133,6 +133,15 @@ import {
 const TIME_MARKER_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-2 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
+// Highlight applied to a drop target while a draggable session hovers it: a
+// soft halo (box-shadow), not a border or a fill. Keyed on the focus-ring
+// token via color-mix — the codebase's idiom for theme-aware tints — so it
+// inverts automatically (a dark halo on the light canvas, a light halo on the
+// dark one) and stays lighter than the old background tint. Pair with
+// `transition-shadow` so it eases in.
+const DROP_TARGET_HIGHLIGHT =
+  "shadow-[0_0_12px_2px_color-mix(in_srgb,var(--ring)_25%,transparent)]";
+
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
@@ -698,9 +707,9 @@ function ProjectFolder({
       ref={setNodeRef}
       className={cn(
         "rounded-md transition-shadow",
-        // Outline-only on drag-over — a ring, no background fill (the fill read
-        // as too heavy a highlight on the folder).
-        isOver && "ring-2 ring-primary ring-inset",
+        // Soft shadow halo on drag-over — no border, no fill (both read as too
+        // heavy a highlight on the folder).
+        isOver && DROP_TARGET_HIGHLIGHT,
       )}
     >
       <ConversationSection
@@ -1357,10 +1366,7 @@ function ChatsDropZone({ active, children }: { active: boolean; children: ReactN
     <div
       ref={setNodeRef}
       data-testid="sidebar-chats-drop-zone"
-      className={cn(
-        "rounded-md transition-shadow",
-        active && isOver && "ring-2 ring-primary ring-inset",
-      )}
+      className={cn("rounded-md transition-shadow", active && isOver && DROP_TARGET_HIGHLIGHT)}
     >
       {children}
     </div>
@@ -1383,10 +1389,7 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
     <div
       ref={setNodeRef}
       data-testid="sidebar-pin-drop-zone"
-      className={cn(
-        "rounded-md transition-shadow",
-        active && isOver && "ring-2 ring-primary ring-inset",
-      )}
+      className={cn("rounded-md transition-shadow", active && isOver && DROP_TARGET_HIGHLIGHT)}
     >
       {children}
     </div>
@@ -1397,7 +1400,8 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
     while dragging a filed session when there are no ungrouped chats (so the
     {@link ChatsDropZone}-wrapped "Chats" section isn't rendered and there'd
     otherwise be nowhere to drop). Releasing on it removes the session from its
-    project. Outline-only highlight on drag-over. */
+    project. The dashed border is the strip's own placeholder identity; the
+    drag-over highlight is the shared soft shadow halo. */
 function UngroupDropZone() {
   const { setNodeRef, isOver } = useDroppable({ id: "__ungroup__", data: { type: "ungroup" } });
   return (
@@ -1405,8 +1409,8 @@ function UngroupDropZone() {
       ref={setNodeRef}
       data-testid="sidebar-ungroup-drop-zone"
       className={cn(
-        "flex items-center gap-1.5 rounded-md border border-dashed px-2 py-1.5 text-muted-foreground text-xs transition-colors",
-        isOver ? "border-primary text-foreground" : "border-border",
+        "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-xs transition-shadow",
+        isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
     >
       <FolderMinusIcon className="size-3.5 shrink-0" />
