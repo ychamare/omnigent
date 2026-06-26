@@ -4,7 +4,7 @@
 
 ### The open-source AI agent framework and meta-harness for all your AI agents.
 
-Omnigent is an open-source **AI agent framework** and meta-harness that gives you a common orchestration layer over Claude Code, Codex, Cursor, Kimi Code, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device.
+Omnigent is an open-source **AI agent framework** and meta-harness that gives you a common orchestration layer over a dozen coding agents — Claude Code, Codex, Cursor, Gemini (Antigravity), GitHub Copilot, Qwen Code, Kimi, Goose, OpenCode, Hermes, Kiro, Pi — and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
@@ -28,10 +28,10 @@ Omnigent lets you:
   follow you: start in your terminal, continue in the browser, pick it up on
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
-- **🤖 Supervise multiple agents.** Use Claude Code, Codex, Pi, and custom
-  agents (defined in YAML) together in the same session. Ask one agent to
-  review another's work, or split a task across agents that are each good at
-  different things.
+- **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, Gemini,
+  Copilot, Qwen, Goose, Pi, and custom agents (defined in YAML) together in
+  the same session. Ask one agent to review another's work, or split a task
+  across agents that are each good at different things.
 
 - **🔌 Use any model.** A first-party API key, a Claude/ChatGPT subscription,
   or any compatible gateway. All first-class.
@@ -45,7 +45,8 @@ Omnigent lets you:
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
-  or [Boxlite](https://github.com/boxlite-ai/boxlite) sandboxes, launched from the
+  [Boxlite](https://github.com/boxlite-ai/boxlite), or
+  [Databricks](https://www.databricks.com) sandboxes, launched from the
   CLI or provisioned by the server per session (*managed hosts*).
 
 - **🛡️ Govern your agents.** Create
@@ -94,17 +95,18 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 - **`uv`** (required). https://docs.astral.sh/uv/getting-started/installation/
   The installer offers to set this up for you.
 - **`git`** (required).
-- **Node.js 22 LTS or newer** with **`npm`**, for the Claude, Codex, and Pi
-  coding harnesses. `omnigent run` installs the harness CLI you pick.
+- **Node.js 22 LTS or newer** with **`npm`**, for the npm-installed coding
+  harnesses (Claude, Codex, Qwen, OpenCode, Pi). `omnigent run` installs the
+  harness CLI you pick.
   https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
-- **`tmux`**, required by the native `omnigent claude` / `omnigent codex` /
-  `omnigent kiro`
-  wrappers (`brew install tmux` / `apt install tmux`; the installer offers
+- **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
+  (`claude`, `codex`, `cursor`, `goose`, `qwen`, `kimi`, `hermes`, `kiro`, …)
+  (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
-- **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent claude` /
-  `omnigent codex` / `omnigent kiro` and `pi` harnesses wrap each agent
+- **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
+  terminal wrappers and the `pi` harness wrap each agent
   terminal in a `bwrap` OS-sandbox; on Linux that isolation is mandatory, so a
   missing `bwrap` binary makes those terminals fail to start
   (`apt install bubblewrap`; the installer offers to install it for you). macOS
@@ -194,8 +196,15 @@ Or launch a specific agent runtime, or your own agent:
 ```bash
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
+omnigent cursor                      # Cursor
+omnigent antigravity                 # Google Antigravity (Gemini)
+omnigent qwen                        # Qwen Code
+omnigent goose                       # Goose (Block)
+omnigent kimi                        # Kimi Code (Moonshot AI)
+omnigent hermes                      # Hermes (Nous Research)
+omnigent opencode                    # OpenCode
 omnigent kiro                        # Kiro CLI
-omnigent kimi                        # Kimi Code (https://kimi.com), headless
+omnigent pi                          # Pi
 omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
 
@@ -250,13 +259,14 @@ omnigent setup
 ```
 
 Add a credential, set a default, or remove one, grouped by agent. Omnigent
-works with four kinds of credentials:
+works with five kinds of credentials:
 
 | | Kind | What it is |
 |---|---|---|
 | 🔑 | **API key** | A first-party vendor key for Anthropic, OpenAI, and similar providers |
 | 🎟️ | **Subscription** | A Claude Pro/Max or ChatGPT plan, via the official `claude` / `codex` CLIs |
 | 🌐 | **Gateway** | Any OpenAI- or Anthropic-compatible `base_url` and key (OpenRouter, LiteLLM, Ollama, vLLM, Azure) |
+| ☁️ | **AWS Bedrock** | A Bedrock (or Bedrock-compatible) endpoint via your AWS credentials |
 | 🧱 | **Databricks** | A Databricks workspace profile (requires the `databricks` extra) |
 
 Defaults are per agent, so a Claude default and a Codex default coexist. You
@@ -289,10 +299,14 @@ mobile, so you get the same chat, sub-agents, terminals, and files, in sync
 with your laptop.
 
 One `docker compose up` runs the server on any host you have (a VPS, a home
-server); Render deploys with one click; Fly.io, Railway, Hugging Face Spaces,
-and Modal are covered too. The server can also provision a cloud sandbox per
-session (*managed hosts*), so no laptop has to stay online. The full menu of
-targets, the database options, and the sandbox setup live in
+server); **Render** and **Railway** deploy with one click; **Fly.io**, **Hugging
+Face Spaces**, **Modal**, **Cloudflare** (serverless, scale-to-zero), and
+**Databricks Apps** (backed by Lakebase Postgres and Unity Catalog Volumes) are
+covered too — and a **Cloudflare quick tunnel** (public) or **Tailscale**
+(private) reaches a server running on your own laptop without a deploy. The
+server can also provision a
+cloud sandbox per session (*managed hosts*), so no laptop has to stay online.
+The full menu of targets, the database options, and the sandbox setup live in
 [`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md).
 
 Once the server is up, sign in and register your laptop as a host:
@@ -401,23 +415,31 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 
 ## Write your own agent
 
-An agent is a short YAML file: your prompt, your tools, and optional helper
-sub-agents a supervisor can delegate to. You don't have to write it by hand:
-agents can build agents, so describe the agent you want in any Omnigent chat
-and it authors the file for you.
+An agent is a short YAML file: your prompt, your tools — local Python
+functions, MCP servers, and sub-agents a supervisor can delegate to. You don't
+have to write it by hand: agents can build agents, so describe the agent you
+want in any Omnigent chat and it authors the file for you.
 
 ```yaml
 name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native, kiro-native, openai-agents, pi, pi-native, antigravity, qwen, kimi, copilot
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor, cursor-native,
+                               # copilot, antigravity, antigravity-native, qwen, qwen-native,
+                               # kimi, kimi-native, goose, goose-native, hermes, hermes-native,
+                               # opencode, kiro-native, pi, pi-native, openai-agents
 
 tools:
   # A local Python function (schema auto-generated from the signature)
   word_count:
     type: function
     callable: mypackage.mymodule.word_count
+
+  # Tools from an MCP server (a local command, or a remote URL)
+  docs:
+    type: mcp
+    url: https://example.com/mcp
 
   # A sub-agent the supervisor can delegate to
   researcher:
