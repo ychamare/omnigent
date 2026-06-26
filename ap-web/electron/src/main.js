@@ -633,20 +633,21 @@ async function connectHostAtConnectTime(serverUrl) {
 }
 
 /**
- * Surface a runner-connect failure as an OS notification — the connect happens
- * after the setup page has navigated away, and an old server SPA has no in-app
- * host indicator, so this is the only reliable feedback.
+ * Surface a runner-connect failure as a native modal dialog. A notification is
+ * unreliable here: the OS suppresses the banner for the frontmost app (the user
+ * just clicked Connect, so the app IS frontmost), and an old server SPA has no
+ * in-app host indicator. A dialog shows regardless of focus or SPA version.
  *
  * @param {string | undefined} error
  */
 function notifyRunnerConnectFailure(error) {
-  if (!Notification.isSupported()) return;
-  const body = (error || "").split("\n")[0].slice(0, 240) || "This machine could not connect.";
-  try {
-    new Notification({ title: "Couldn't connect this machine as a runner", body }).show();
-  } catch {
-    // Notification construction can throw on some platforms; nothing to do.
-  }
+  const detail = (error || "").trim() || "This machine could not connect to the server.";
+  void dialog.showMessageBox(activeWindow() ?? undefined, {
+    type: "warning",
+    title: "Couldn't connect this machine as a runner",
+    message: "Couldn't connect this machine as a runner",
+    detail,
+  });
 }
 
 /**
