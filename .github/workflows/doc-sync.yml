@@ -237,8 +237,14 @@ jobs:
           import json, pathlib
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
-          truncated = pathlib.Path("/tmp/diff_truncated").read_text().strip() == "true"
-          trunc_note = ("\n> NOTE: the diff was truncated at 512 KB — you are seeing only part of it. "
+          # The classifier is tools-less (no file access), so its diff must be
+          # inline — but `omnigent run -p` passes the whole prompt as one argv
+          # string, and Linux caps a single arg at ~128 KiB (MAX_ARG_STRLEN). Cap
+          # the inline diff well under that; a verdict tolerates a partial diff.
+          MAX_INLINE_DIFF = 100_000
+          truncated = pathlib.Path("/tmp/diff_truncated").read_text().strip() == "true" or len(diff) > MAX_INLINE_DIFF
+          diff = diff[:MAX_INLINE_DIFF]
+          trunc_note = ("\n> NOTE: the diff is truncated — you are seeing only part of it. "
                         "If the visible portion is inconclusive, lean toward needs-doc-update.\n" if truncated else "")
           files = "\n".join(f"- {f['path']} (+{f['additions']}/-{f['deletions']})"
                             for f in meta.get("files", [])[:200])
@@ -367,26 +373,19 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/unclassified_comment.md
 
       # --- Draft path: only when a doc update is needed ---
-      - name: Mint omnigent-site App token
-        id: site-token
-        if: steps.decide.outputs.draft == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
-        with:
-          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
-          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
-          owner: omnigent-ai
-          repositories: omnigent-site
-
+      # The omnigent-site write-token is minted LATER (after the drafter runs), so
+      # it is never present while the PR-influenced drafter executes. Here we only
+      # need to READ omnigent-site (it is public) — github.token suffices, and we
+      # do NOT persist credentials so no token sits in omnigent-site/.git/config
+      # where the unsandboxed drafter could read it.
       - name: Check out omnigent-site (docs)
         if: steps.decide.outputs.draft == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           repository: omnigent-ai/omnigent-site
           path: omnigent-site
-          token: ${{ steps.site-token.outputs.token || github.token }}
-          # Persist the checkout credential so the later `git push` authenticates
-          # via http.extraheader — no token embedded in the push URL.
-          persist-credentials: true
+          token: ${{ github.token }}
+          persist-credentials: false
 
       - name: Build drafter prompt
         if: steps.decide.outputs.draft == 'true'
@@ -395,29 +394,29 @@ jobs:
         run: |
           set -euo pipefail
           python3 -u <<'PYEOF'
-          import json, os, pathlib
+          import json, os, pathlib, shutil
           ws = os.environ["GITHUB_WORKSPACE"]
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
-          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
           truncated = pathlib.Path("/tmp/diff_truncated").read_text().strip() == "true"
           trunc_note = ("\n> NOTE: the diff was truncated at 512 KB — document only what the visible "
                         "portion supports and flag the rest for manual review.\n" if truncated else "")
           body = (meta.get("body") or "")[:4000]
+          # Hand the FULL diff to the drafter via a file in its cwd, not inline in
+          # the prompt: a large diff (PR #881 was 162 KB) would exceed Linux's
+          # ~128 KiB single-argv limit (MAX_ARG_STRLEN) and `omnigent run -p`
+          # couldn't even execve. The drafter reads DIFF_FILE with sys_os_read.
+          shutil.copyfile("/tmp/pr_diff.txt", pathlib.Path(ws) / "_pr_diff.txt")
           prompt = f"""SITE_REPO={ws}/omnigent-site
           PR_NUMBER={os.environ['PR_NUMBER']}
           PR_TITLE={meta['title']}
+          DIFF_FILE=./_pr_diff.txt
 
-          The merged PR's description and diff follow — that diff is your source of
-          truth. Draft the omnigent-site docs update per your instructions, then
-          print the DOC_DRAFT_SUMMARY block.
+          Read DIFF_FILE first — it holds the merged PR's full diff and is your
+          source of truth. Then draft the omnigent-site docs update per your
+          instructions and print the DOC_DRAFT_SUMMARY block.
           {trunc_note}
           ## Description
           {body if body else '(no description)'}
-
-          ## Diff
-          ```diff
-          {diff}
-          ```
           """
           pathlib.Path("/tmp/draft_prompt.txt").write_text(prompt)
           PYEOF
@@ -425,9 +424,10 @@ jobs:
       - name: Run drafter
         id: draft
         if: steps.decide.outputs.draft == 'true'
-        # cwd = the workspace root (NOT omnigent-site): the sandbox needs the
-        # omnigent venv/interpreter inside cwd to launch its os_env helper. Writes
-        # are confined to the omnigent-site subdir by the agent's sandbox spec.
+        # cwd = the workspace root: it holds both the PR-diff file the drafter reads
+        # (_pr_diff.txt) and the omnigent-site checkout it writes into. The only
+        # secret in this step's env is LLM_API_KEY (the site write-token is minted
+        # later, after this step) — same exposure as the polly-review CI agent.
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
@@ -481,6 +481,18 @@ jobs:
             fi
           fi
 
+      # Mint the omnigent-site write-token ONLY now — after the drafter has run and
+      # produced changes. It never coexists with the (PR-influenced) drafter.
+      - name: Mint omnigent-site App token
+        id: site-token
+        if: steps.sitechanges.outputs.changed == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: omnigent-ai
+          repositories: omnigent-site
+
       - name: Build site PR body and resolve reviewer
         id: sitepr
         if: steps.sitechanges.outputs.changed == 'true'
@@ -531,6 +543,7 @@ jobs:
         working-directory: omnigent-site
         env:
           GH_TOKEN: ${{ steps.site-token.outputs.token }}
+          SITE_TOKEN: ${{ steps.site-token.outputs.token }}
           PR_NUMBER: ${{ steps.plan.outputs.pr }}
           REVIEWER: ${{ steps.sitepr.outputs.reviewer }}
         run: |
@@ -538,6 +551,11 @@ jobs:
           BRANCH="auto/docs/pr-${PR_NUMBER}"
           git config user.name  "omnigent-ci[bot]"
           git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+          # Credentials are NOT persisted in .git/config (so the drafter couldn't
+          # read them); authenticate the push with an inline bearer header instead
+          # of embedding the token in the remote URL. Reads (ls-remote/fetch) need
+          # no auth — omnigent-site is public.
+          AUTH=(-c "http.extraheader=AUTHORIZATION: bearer ${SITE_TOKEN}")
 
           # Don't clobber human edits: if the rolling branch already exists with a
           # HEAD commit by someone other than the bot, leave it as-is.
@@ -556,10 +574,9 @@ jobs:
           git checkout -B "$BRANCH"
           git add -A
           git commit -m "docs: document ${CODE_REPO}#${PR_NUMBER}"
-          # Push via the credential persisted by actions/checkout (http.extraheader) —
-          # no token in the push URL. --force is safe here: the guard above ensured
-          # the branch carries only bot commits.
-          git push --force origin "$BRANCH"
+          # --force is safe here: the guard above ensured the branch carries only
+          # bot commits.
+          git "${AUTH[@]}" push --force origin "$BRANCH"
 
           REVIEWER_ARG=()
           [ -n "${REVIEWER}" ] && REVIEWER_ARG=(--reviewer "${REVIEWER}")

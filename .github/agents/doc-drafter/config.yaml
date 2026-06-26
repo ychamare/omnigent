@@ -29,28 +29,26 @@ executor:
 async: true
 cancellable: true
 
-# Hardened os_env. The agent ingests the merged PR's diff/description as input, so
-# it runs under a network-denying sandbox to neutralize prompt-injection
-# exfiltration. `type` is omitted → it resolves to the platform default
-# (linux_bwrap in CI, darwin_seatbelt on macOS). `allow_network: false` blocks all
-# outbound network for the sys_os_shell helper (curl/wget/nc) AND filters its env
-# to the passthrough allowlist, so LLM_API_KEY is never visible to the shell. The
-# claude-sdk harness (a separate process) still reaches the model gateway.
-#
-# cwd is the WORKSPACE ROOT (the run step sets the process cwd there), which holds
-# both the omnigent venv/interpreter and the `omnigent-site` checkout. cwd must
-# contain the interpreter: the os_env helper is launched with the omnigent venv's
-# python, and a sandbox confined to a subtree that excludes it denies exec
-# (sandbox-exec / bwrap: "Operation not permitted"). `write_paths: ["omnigent-site"]`
-# then confines WRITES to the docs checkout; the workspace is readable (only public
-# code lives there — secrets are in $HOME/env, outside the jail) but cannot be
-# written, and there is no network.
+# os_env runs unsandboxed (sandbox: none) — the same posture as the in-repo CI
+# reviewer `examples/polly` (polly-review.yml), which also reads files with the
+# LLM key in env. Security does NOT rely on a sandbox; it relies on trusted input
+# + output scanning, and the drafter sits in a STRONGER trust position than Polly:
+#   - It only runs on ALREADY-MERGED PRs (a maintainer reviewed + merged the diff),
+#     whereas Polly runs on open, un-reviewed PRs.
+#   - The only secret in this process's env is LLM_API_KEY (same as Polly). The
+#     omnigent-site write-token is minted by the workflow AFTER this agent finishes
+#     and is never present while the (PR-influenced) drafter runs.
+#   - The workflow scans both the agent output and the drafted file changes for the
+#     key before anything is pushed.
+# A network-denying sandbox would be strictly stronger, but it proved fragile in
+# CI (uv-venv interpreter exec under bwrap/seatbelt) for no blast-radius gain over
+# the accepted Polly model. cwd is the workspace root (holds the PR-diff file the
+# drafter reads and the omnigent-site checkout it writes).
 os_env:
   type: caller_process
   cwd: .
   sandbox:
-    allow_network: false
-    write_paths: ["omnigent-site"]
+    type: none
 
 # Same blast_radius guardrail as the rest of the project: catastrophic commands
 # denied; ordinary git reads run without an ASK (headless can't approve).
@@ -73,18 +71,21 @@ prompt: |
 
   ## Inputs (in the run prompt)
   - `SITE_REPO` — absolute path to the omnigent-site checkout. It is your ONLY
-    WRITE target — make all doc edits there. You run in a network-denying sandbox
-    (no outbound network of any kind), so ground every fact in the PR diff below
-    rather than fetching anything.
-  - `PR_NUMBER`, `PR_TITLE` — the merged source PR.
-  - The PR diff and description are included below the inputs — that diff is your
-    source of truth for what changed.
+    WRITE target — make all doc edits there.
+  - `DIFF_FILE` — a path (in your current directory) to a file holding the merged
+    PR's full diff. **Read it first with `sys_os_read`** — it is your source of
+    truth for what changed. (The diff is in a file, not inline, because a large
+    diff would exceed the command-line length limit.)
+  - `PR_NUMBER`, `PR_TITLE` — the merged source PR. The PR description is inline
+    below.
+  Ground every fact in `DIFF_FILE` and the existing site content — do not fetch
+  external resources.
 
   ## Step 1 — Understand the change
-  Read the diff and PR description carefully — they are your source of truth. Pull
-  exact facts (flags, defaults, harness ids, CLI names, config keys) from the diff
-  itself. Never invent a fact; if the diff doesn't settle something a doc must
-  state, flag it for manual review rather than guessing.
+  Read `DIFF_FILE` (with `sys_os_read`) and the PR description carefully — they are
+  your source of truth. Pull exact facts (flags, defaults, harness ids, CLI names,
+  config keys) from the diff itself. Never invent a fact; if the diff doesn't
+  settle something a doc must state, flag it for manual review rather than guessing.
 
   ## Step 2 — Inspect the live site and decide placement
   This is why you have the whole site checked out. Read

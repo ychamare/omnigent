@@ -106,82 +106,53 @@ jobs:
           pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
           "
 
-      # --- (0) bubblewrap availability: is the sandbox real or a silent no-op? ---
-      - name: Probe bubblewrap availability
-        id: bwrap
-        run: |
-          set -euo pipefail
-          if command -v bwrap >/dev/null 2>&1; then
-            echo "PREINSTALLED=yes (bwrap at $(command -v bwrap))"
-            echo "preinstalled=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "PREINSTALLED=no — installing bubblewrap"
-            echo "preinstalled=no" >> "$GITHUB_OUTPUT"
-            sudo apt-get update && sudo apt-get install -y bubblewrap
-          fi
-          echo "bwrap: $(command -v bwrap)"
-          bwrap --version || true
-
-      # --- (1) The drafter's sandbox must resolve to linux_bwrap + net off ---
-      - name: Assert drafter sandbox is active (not 'none')
+      # --- Sanity: confirm the drafter is unsandboxed (Polly's posture) ---
+      - name: Show drafter sandbox posture
         run: |
           set -euo pipefail
           uv run --no-sync python - <<'PY'
-          import sys
           from pathlib import Path
-          from omnigent.inner.sandbox import _default_sandbox_for_platform
           from omnigent.spec import load
-          print("platform default sandbox:", _default_sandbox_for_platform().type)
-          s = load(Path(".github/agents/doc-drafter"))
-          sb = s.os_env.sandbox
-          print(f"drafter sandbox.type   = {sb.type}")
-          print(f"drafter allow_network  = {sb.allow_network}")
-          print(f"drafter write_paths    = {sb.write_paths}")
-          if sb.type == "none":
-              print("::error::drafter sandbox resolved to 'none' — hardening is a SILENT NO-OP on this runner")
-              sys.exit(1)
-          if sb.allow_network is not False:
-              print("::error::drafter sandbox allows network — egress not blocked")
-              sys.exit(1)
-          print("OK: drafter runs under", sb.type, "with network denied")
+          sb = load(Path(".github/agents/doc-drafter")).os_env.sandbox
+          print(f"drafter sandbox.type = {sb.type}  (expected: none, matching examples/polly)")
           PY
 
-      # --- (2) Drafter end-to-end under bwrap: interpreter launches + writes MDX ---
-      - name: Build drafter prompt from PR #881 diff
+      # --- Drafter end-to-end on Linux with the FILE-based diff (the argv fix) ---
+      # PR #881's diff is ~162 KB — larger than Linux's ~128 KiB single-argv limit,
+      # which is exactly what broke when the diff was passed inline via -p. This
+      # proves the file-based hand-off works and the drafter writes MDX on Linux.
+      - name: Build drafter prompt from PR #881 diff (file-based)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh api "repos/omnigent-ai/omnigent/pulls/881" \
             -H "Accept: application/vnd.github.v3.diff" | head -c 524288 > /tmp/pr_diff.txt || true
+          echo "diff bytes: $(wc -c < /tmp/pr_diff.txt)"
           gh pr view 881 --repo omnigent-ai/omnigent --json title,body > /tmp/pr_meta.json
           python3 -u <<'PYEOF'
-          import json, os, pathlib
+          import json, os, pathlib, shutil
           ws = os.environ["GITHUB_WORKSPACE"]
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
-          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
           body = (meta.get("body") or "")[:4000]
+          shutil.copyfile("/tmp/pr_diff.txt", pathlib.Path(ws) / "_pr_diff.txt")
           prompt = f"""SITE_REPO={ws}/omnigent-site
           PR_NUMBER=881
           PR_TITLE={meta['title']}
+          DIFF_FILE=./_pr_diff.txt
 
-          The merged PR's description and diff follow — that diff is your source of
-          truth. Draft the omnigent-site docs update per your instructions, then
-          print the DOC_DRAFT_SUMMARY block.
+          Read DIFF_FILE first — it holds the merged PR's full diff and is your
+          source of truth. Then draft the omnigent-site docs update per your
+          instructions and print the DOC_DRAFT_SUMMARY block.
 
           ## Description
           {body if body else '(no description)'}
-
-          ## Diff
-          ```diff
-          {diff}
-          ```
           """
           pathlib.Path("/tmp/draft_prompt.txt").write_text(prompt)
-          print(f"prompt built: {len(prompt)} chars")
+          print(f"prompt built: {len(prompt)} chars (diff handed off via file)")
           PYEOF
 
-      - name: Run drafter under bwrap
+      - name: Run drafter
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
@@ -193,21 +164,21 @@ jobs:
             2>draft-stderr.log | tee /tmp/draft_out.txt \
             || { echo "::warning::drafter exited non-zero"; cat draft-stderr.log; }
 
-      - name: Assert the drafter wrote MDX (interpreter launched under bwrap)
+      - name: Assert the drafter wrote MDX
         working-directory: omnigent-site
         run: |
           set -euo pipefail
           echo "=== omnigent-site working-tree changes ==="
           git --no-pager diff --stat
-          if grep -qiE "execvp|Operation not permitted|os_env helper failed|exit(ed)? .*code 71" /tmp/draft_out.txt ../draft-stderr.log 2>/dev/null; then
-            echo "::error::Found a sandbox helper-launch failure in drafter output — the regression is NOT fixed under bwrap."
+          if grep -qiE "Argument list too long|execvp|os_env helper failed" /tmp/draft_out.txt ../draft-stderr.log 2>/dev/null; then
+            echo "::error::Found a launch/argv failure in drafter output — the drafter did not run."
             exit 1
           fi
           if [ -z "$(git status --porcelain)" ]; then
-            echo "::error::Drafter produced NO file changes under bwrap — it could not write (sandbox likely broke the helper)."
+            echo "::error::Drafter produced NO file changes — it ran but wrote nothing."
             exit 1
           fi
-          echo "OK: drafter wrote MDX under bwrap — the os_env helper launched and writes succeeded."
+          echo "OK: drafter ran on Linux with the file-based diff and wrote MDX."
 
       - name: Upload artifacts
         if: always()
