@@ -144,8 +144,7 @@ def test_pi_gateway_run_loads_global_extensions(
     )
 
     assert result.returncode == 0, (
-        "pi gateway run failed; stdout:\n"
-        f"{result.stdout!r}\n\nstderr:\n{result.stderr!r}"
+        f"pi gateway run failed; stdout:\n{result.stdout!r}\n\nstderr:\n{result.stderr!r}"
     )
     assert marker_path.is_file(), (
         "Pi extension marker missing — gateway managed agent dir was not seeded "
