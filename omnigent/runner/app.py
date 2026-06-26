@@ -4687,18 +4687,19 @@ async def _auto_create_claude_terminal(
     _publish_tmux_target_for_bridge(
         resource_registry=resource_registry,
         session_id=session_id,
-        # The bridge dir was created via ``prepare_bridge_dir(session_id)``
-        # above (no explicit bridge_id), so it is keyed by session_id.
-        # Pass the same id so the tmux target lands in that dir and the
-        # claude-native harness can find it.
-        bridge_id=session_id,
+        # Use the SAME bridge id the dir was prepared under (``bridge_id``,
+        # which is the "-cleared" fork for a /clear-superseded resume, else
+        # session_id). Hardcoding session_id here would write tmux.json into
+        # D(session_id) while the executor + forwarder read D(bridge_id) — the
+        # "tmux target not advertised yet" mismatch on a resumed old session.
+        bridge_id=bridge_id,
         terminal_name="claude",
         session_key="main",
     )
     _logger.info(
         "Claude terminal tmux target published: session=%s bridge_id=%s",
         session_id,
-        session_id,
+        bridge_id,
     )
 
     # Start the transcript forwarder so Claude's responses flow

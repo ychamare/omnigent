@@ -12888,10 +12888,25 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         _no_op_forwarder,
     )
 
-    class _FakeResourceRegistry:
-        """Returns a minimal terminal view; no live terminal registry."""
+    class _FakeInstance:
+        """Minimal live terminal instance for the tmux-target publish."""
 
-        terminal_registry = None
+        running = True
+        socket_path = "/tmp/fake-claude.sock"
+        tmux_target = "claude:0.0"
+
+    class _FakeTerminalRegistry:
+        """Returns the live instance for any (session, terminal, key) lookup."""
+
+        def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+            """Return the fake live instance."""
+            del conversation_id, terminal_name, session_key
+            return _FakeInstance()
+
+    class _FakeResourceRegistry:
+        """Resource registry exposing a live terminal registry."""
+
+        terminal_registry = _FakeTerminalRegistry()
 
         async def launch_required_terminal(
             self,
@@ -12944,9 +12959,16 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     )
     await fake_client.aclose()
 
+    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared-cleared")
+    natural_dir = claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared")
     # The isolated cleared dir is prepared; the natural (live-sibling) dir is not.
-    assert claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared-cleared").exists()
-    assert not claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared").exists()
+    assert cleared_dir.exists()
+    assert not natural_dir.exists()
+    # tmux.json (what the executor reads to inject) must land in the SAME dir the
+    # executor + forwarder use — the cleared dir — NOT the natural session_id dir.
+    # Hardcoding session_id there was the "tmux target not advertised yet" bug.
+    assert (cleared_dir / "tmux.json").exists()
+    assert not (natural_dir / "tmux.json").exists()
 
     import json as _json
 
