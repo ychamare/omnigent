@@ -193,7 +193,7 @@ in a native window and adds OS notifications and a dock badge —
 omnigent
 ```
 
-Or launch a specific agent runtime, or your own agent:
+Or launch a specific agent runtime:
 
 ```bash
 omnigent claude                      # Claude Code, in a session your team can join
@@ -202,7 +202,6 @@ omnigent cursor                      # Cursor
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes (Nous Research)
 omnigent pi                          # Pi
-omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
 ```
 
 #### 🐙 Polly and 🟠🔵 Debby
@@ -213,11 +212,9 @@ Two example agents ship with the repo, and they make good first sessions:
 omnigent run examples/polly/
 omnigent run examples/debby/
 
-# Run an orchestrator on a different harness (sub-agents keep their own):
-omnigent run examples/polly/ --harness pi
-omnigent run examples/debby/ --harness openai-agents
-omnigent run examples/polly/ --harness cursor
-omnigent run examples/polly/ --harness copilot
+# ...or on a different harness (sub-agents keep their own):
+omnigent run examples/polly/ --harness <harness>
+omnigent run examples/debby/ --harness <harness>
 ```
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
