@@ -30,6 +30,9 @@ const MAX_LOG_CHARS = 8000;
 /** serverUrl(normalized) -> { child, serverUrl, log } for host processes we started. */
 const hostChildren = new Map();
 
+/** serverUrl(normalized) -> in-flight ensureHostConnected promise (dedup). */
+const connectingHosts = new Map();
+
 /** { url, port, pid } when this app started the local server; null otherwise. */
 let ownedLocalServer = null;
 
@@ -151,7 +154,30 @@ async function ensureHostConnected(cliPath, serverUrl) {
   const key = cli.normalizeServerUrl(serverUrl);
   if (key === "") return { ok: false, ownedByDesktop: false, error: "missing server URL" };
   if (ownsLiveHost(key)) return { ok: true, ownedByDesktop: true };
+  // Dedupe concurrent connects for the same server (the restore-on-load path
+  // racing the connect-time path, or a double-clicked Start) so we never spawn
+  // two `omnigent host` processes for one target.
+  const inflight = connectingHosts.get(key);
+  if (inflight) return inflight;
+  const op = connectHost(cliPath, serverUrl, key);
+  connectingHosts.set(key, op);
+  try {
+    return await op;
+  } finally {
+    connectingHosts.delete(key);
+  }
+}
 
+/**
+ * The actual connect: adopt a daemon already serving this target, else spawn
+ * and track one. Serialized per target by ensureHostConnected.
+ *
+ * @param {string} cliPath
+ * @param {string} serverUrl
+ * @param {string} key Normalized server URL.
+ * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, adopted?: boolean, error?: string }>}
+ */
+async function connectHost(cliPath, serverUrl, key) {
   const status = await cli.getHostStatus(cliPath, serverUrl);
   const conn = cli.connectionFromStatus(status, serverUrl);
   if (conn.process === "online") {

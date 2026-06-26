@@ -634,6 +634,46 @@ function resolvedCliPath() {
   return resolved ? resolved.path : null;
 }
 
+/**
+ * Servers (normalized URLs) for which desktop-managed hosting was on. Persisted
+ * so a host that was running when the app closed is restored on next launch —
+ * the daemon is torn down on quit, but the *intent* survives here. Updated when
+ * the user starts/stops hosting; quit-time teardown deliberately does NOT clear
+ * it.
+ *
+ * @returns {string[]}
+ */
+function loadHostServers() {
+  const list = loadSettings().host_servers;
+  return Array.isArray(list) ? list.filter((s) => typeof s === "string") : [];
+}
+
+/**
+ * Record (or clear) whether desktop hosting should be active for a server.
+ *
+ * @param {string} serverUrl
+ * @param {boolean} enabled
+ */
+function setHostServerEnabled(serverUrl, enabled) {
+  const key = omnigentCli.normalizeServerUrl(serverUrl);
+  if (key === "") return;
+  const settings = loadSettings();
+  const without = loadHostServers().filter((s) => omnigentCli.normalizeServerUrl(s) !== key);
+  settings.host_servers = enabled ? [...without, key] : without;
+  saveSettings(settings);
+}
+
+/**
+ * Whether a server is remembered as host-enabled (restore on launch).
+ *
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function isHostServerEnabled(serverUrl) {
+  const key = omnigentCli.normalizeServerUrl(serverUrl);
+  return loadHostServers().some((s) => omnigentCli.normalizeServerUrl(s) === key);
+}
+
 /** Maximum number of entries kept in the persisted recent-servers list. */
 const MAX_RECENT_SERVERS = 5;
 
@@ -923,16 +963,35 @@ function createWindow(targetUrl, opts = {}) {
   // WORKSPACE_CHROME_HIDE_CSS. Re-applied on every full load (a server switch
   // is a fresh document); the SPA's own client-side routing keeps the same
   // document, so the injected stylesheet persists across in-app navigation.
+  // Restore desktop hosting at most once per window, when it first lands on its
+  // pinned server (below).
+  let hostRestoreAttempted = false;
   win.webContents.on("did-finish-load", () => {
+    const urlStr = win.webContents.getURL();
     let pathname = "";
     try {
-      pathname = new URL(win.webContents.getURL()).pathname;
+      pathname = new URL(urlStr).pathname;
     } catch {
       return;
     }
     if (pathname.startsWith(WORKSPACE_UI_PATH)) {
       void win.webContents.insertCSS(WORKSPACE_CHROME_HIDE_CSS);
     }
+    // If hosting was on for this server last session, reconnect the daemon now
+    // that the window has actually reached the server (not an auth redirect or
+    // the setup page). Once per window; ensureHostConnected dedups/adopts, so
+    // this is safe alongside the connect-time path.
+    const state = windows.get(win);
+    if (hostRestoreAttempted || !state || !state.origin || !state.serverUrl) return;
+    if (originOf(urlStr) !== state.origin) return;
+    hostRestoreAttempted = true;
+    if (!isHostServerEnabled(state.serverUrl)) return;
+    const cliPath = resolvedCliPath();
+    if (!cliPath) return;
+    serverManager
+      .ensureHostConnected(cliPath, state.serverUrl)
+      .then(broadcastHostStatus)
+      .catch(() => {});
   });
 
   win.on("closed", () => {
@@ -1459,6 +1518,9 @@ function registerIpc() {
       settings.server_url = target;
       settings.host_on_connect = host;
       saveSettings(settings);
+      // Explicit opt-out: connecting with the toggle off clears any remembered
+      // hosting for this server, so it isn't restored on the next launch.
+      if (!host) setHostServerEnabled(target, false);
     }
     if (win) {
       // The user explicitly chose this server — it becomes the window's
@@ -1479,7 +1541,10 @@ function registerIpc() {
           // Start hosting only after the server actually responded, so we never
           // spawn a host for a typo'd / unreachable URL. Best-effort: a failure
           // surfaces in the sidebar host indicator, not as a connect error.
+          // Remembered (host_servers) so it's restored on the next launch —
+          // except for ephemeral windows, whose connections are never saved.
           if (host) {
+            if (!ephemeral) setHostServerEnabled(target, true);
             const cliPath = resolvedCliPath();
             if (cliPath) {
               serverManager
@@ -1812,6 +1877,10 @@ function registerIpc() {
     else if (action === "stop") result = await serverManager.disconnectHost(cliPath, serverUrl);
     else if (action === "restart") result = await serverManager.restartHost(cliPath, serverUrl);
     else result = { ok: false, error: `unknown host action '${action}'` };
+    // Remember the intent so a running host is restored on next launch: a
+    // successful start/restart enables it; an explicit stop clears it.
+    if (action === "stop") setHostServerEnabled(serverUrl, false);
+    else if (result.ok) setHostServerEnabled(serverUrl, true);
     broadcastHostStatus();
     return result;
   });

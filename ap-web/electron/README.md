@@ -354,6 +354,13 @@ them (and stops a local server it started), so closing the app disconnects this
 machine. A daemon the shell merely _adopted_ (you started it in a terminal) is
 left running on quit.
 
+**Restored on next launch.** Whether hosting was on is remembered per server
+(`settings.json` → `host_servers`), updated when you start or stop hosting and
+deliberately _not_ cleared by quit-time teardown. So if the daemon was running
+when you closed the app, it's reconnected automatically once the window reaches
+that server again — and a connect-time opt-out (or a sidebar Stop) clears the
+memory so it stays off.
+
 ## Passkeys (WebAuthn)
 
 External security keys (e.g. a YubiKey) work out of the box: Chromium's
