@@ -453,6 +453,24 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
+
+            # Neutralize agent discovery so ONLY the stubbed Claude agent feeds
+            # the picker. The landing picker merges `/v1/agents` with agents found
+            # by scanning the caller's sessions (`/v1/sessions?kind=any`); on the
+            # shared e2e_ui server a native agent another test left behind would
+            # otherwise leak in and — ranking ahead — auto-select, so opening
+            # Claude's submenu and picking a knob would SWITCH agent mid-flow
+            # (remounting the submenu and detaching the next row). Registered
+            # after _register_common_routes so it wins the kind=any scan.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
             # Seed a recent working directory for the stubbed host so the
             # working-directory chip auto-fills and Send can enable without
             # touching the (host-less) file browser. Set before the SPA boots
@@ -523,6 +541,22 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
+
+            # Neutralize agent discovery so ONLY the stubbed Claude agent feeds
+            # the picker (see _drive_permission_mode for the full rationale): a
+            # leaked native agent auto-selecting ahead of Claude would make the
+            # model pick SWITCH agent, remounting the submenu and detaching the
+            # effort row before it can be clicked. Registered after
+            # _register_common_routes so it wins the kind=any scan.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
