@@ -12019,6 +12019,12 @@ def create_runner_app(
             )
             return _cnb.bridge_dir_for_bridge_id(bridge_id) / _cnb._PERMISSION_HOOK_FILE
         if harness == "opencode-native":
+            # opencode is the one harness whose popup config is minted fresh here
+            # (claude/codex reuse their permission/policy hook files, which carry
+            # the routing header already). The popup subprocess replays these
+            # static headers, so pair the bearer with the workspace-routing
+            # header — bearer alone misroutes the popup's POST to the account.
+            from omnigent.cli_auth import databricks_auth_headers
             from omnigent.opencode_native_bridge import (
                 bridge_dir_for_bridge_id as _oc_bridge_dir,
             )
@@ -12027,13 +12033,14 @@ def create_runner_app(
             )
             from omnigent.runner._entry import _make_auth_token_factory
 
+            _server_url = _required_runner_env("RUNNER_SERVER_URL")
             _factory = _make_auth_token_factory()
             _token = _factory() if _factory is not None else None
             return await asyncio.to_thread(
                 write_cost_popup_config,
                 _oc_bridge_dir(conv_id),
-                ap_server_url=_required_runner_env("RUNNER_SERVER_URL"),
-                ap_auth_headers={"Authorization": f"Bearer {_token}"} if _token else {},
+                ap_server_url=_server_url,
+                ap_auth_headers=databricks_auth_headers(_server_url, _token),
             )
         from omnigent import codex_native_bridge as _cxb
 
