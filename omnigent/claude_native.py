@@ -3471,6 +3471,28 @@ def _claude_transcript_records_from_session_items(
                 records.clear()
                 parent_uuid = None
                 tool_parent_by_call_id.clear()
+                # Emit a compact_boundary system record so Claude
+                # Code recognizes the compaction on resume.
+                boundary_uuid = _synthetic_claude_transcript_uuid(
+                    session_id=session_id,
+                    external_session_id=external_session_id,
+                    item=item,
+                    index=index,
+                )
+                records.append(
+                    {
+                        "parentUuid": None,
+                        "isSidechain": False,
+                        "type": "system",
+                        "subtype": "compact_boundary",
+                        "content": "Conversation compacted",
+                        "isMeta": False,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "uuid": boundary_uuid,
+                        "level": "info",
+                    }
+                )
+                parent_uuid = boundary_uuid
                 for ci, cm in enumerate(compacted_msgs):
                     cm_uuid = _synthetic_claude_transcript_uuid(
                         session_id=session_id,
