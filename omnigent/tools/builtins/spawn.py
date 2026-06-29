@@ -373,7 +373,6 @@ def _build_sys_session_send_schema(
                                                 ),
                                             },
                                         },
-                                        "additionalProperties": False,
                                         "description": (
                                             "Optional per-subagent cost budget configuration "
                                             "with max_cost_usd (hard limit) and/or "
