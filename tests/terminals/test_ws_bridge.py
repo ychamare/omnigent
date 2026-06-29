@@ -1522,3 +1522,62 @@ def test_monotonic_returns_float() -> None:
     assert isinstance(val, float)
     # Monotonic: a second call should be >= the first.
     assert _monotonic() >= val
+
+
+@pytest.mark.asyncio
+async def test_check_pane_dead_definitive_tri_state(tmp_path: Path) -> None:
+    """
+    _check_pane_dead_definitive returns True/False/None for dead/alive/inconclusive.
+
+    This tri-state API prevents false positives where a transient probe error
+    (timeout, spawn failure) would wrongly close a healthy live session.
+    Only a definitive "pane is dead" (rc=0, #{pane_dead}=1) closes the bridge.
+
+    :param tmp_path: Pytest tmp directory for the private socket.
+    """
+    if not _HAS_TMUX:  # pragma: no cover
+        pytest.skip("tmux not found")
+
+    from omnigent.terminals.ws_bridge import _check_pane_dead_definitive
+
+    socket_path = tmp_path / "tmux.sock"
+    base = ["tmux", "-S", str(socket_path), "-f", "/dev/null"]
+    subprocess.run(
+        [
+            *base,
+            "set-option",
+            "-g",
+            "remain-on-exit",
+            "on",
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            "main",
+            "sh -c 'exit 0'",
+        ],
+        check=True,
+    )
+    try:
+        # Poll until pane is confirmed dead
+        for _ in range(250):
+            result = await _check_pane_dead_definitive(str(socket_path), "main")
+            if result is True:
+                break
+            await asyncio.sleep(0.02)
+        else:  # pragma: no cover
+            raise AssertionError("dead pane was never reported as dead")
+
+        # Test live pane returns False (not None)
+        subprocess.run(
+            [*base, "new-session", "-d", "-s", "live", "sh"],
+            check=True,
+        )
+        result = await _check_pane_dead_definitive(str(socket_path), "live")
+        assert result is False, "live pane should return False, not None"
+
+        # Test inconclusive error (non-existent target) returns None
+        result = await _check_pane_dead_definitive(str(socket_path), "nonexistent")
+        assert result is None, "inconclusive probe should return None, not False"
+    finally:
+        subprocess.run([*base, "kill-server"], capture_output=True, check=False)

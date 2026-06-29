@@ -621,7 +621,7 @@ async def bridge_tmux_pty_to_websocket(
     loop.add_reader(master_fd, _on_pty_readable)
 
     async def _ws_to_pty() -> None:
-        nonlocal last_client_input_at
+        nonlocal last_client_input_at, last_pane_check_at
         try:
             while True:
                 msg = await websocket.receive()
@@ -661,7 +661,6 @@ async def bridge_tmux_pty_to_websocket(
                         or _monotonic() - last_pane_check_at > _PANE_LIVENESS_CHECK_CACHE_S
                     )
                     if pane_check_due:
-                        nonlocal last_pane_check_at
                         last_pane_check_at = _monotonic()
                         is_dead = await _check_pane_dead_definitive(socket_path, tmux_target)
                         if is_dead is True:
