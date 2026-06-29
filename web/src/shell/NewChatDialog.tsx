@@ -54,6 +54,7 @@ import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { readLastModeForHarness, writeLastModeForHarness } from "@/lib/modePreferences";
+import { readLastModelForHarness, writeLastModelForHarness } from "@/lib/modelPreferences";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
@@ -1335,19 +1336,35 @@ function AgentHarnessPicker({
       if (entryHarness) writeLastModeForHarness(entryHarness, mode);
       setMode(mode);
     };
+    // Same show-the-live-pick-or-the-stored-last logic for the model/effort
+    // knobs (only the claude-native entry has them). Falls back to the default
+    // when nothing's stored or the stored id has since retired.
+    const stored = entryHarness ? readLastModelForHarness(entryHarness) : null;
+    const modelValue = isSelected
+      ? pickedModel
+      : stored?.model != null && CLAUDE_NATIVE_MODELS.some((m) => m.id === stored.model)
+        ? stored.model
+        : CLAUDE_NATIVE_DEFAULT_MODEL;
+    const effortValue = isSelected
+      ? pickedEffort
+      : stored?.effort != null && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+        ? stored.effort
+        : CLAUDE_NATIVE_DEFAULT_EFFORT;
 
     if (nativeAgentHasCapability(agent, "permissionMode")) {
       return (
         <>
           <ModelEffortOptions
-            model={pickedModel}
-            effort={pickedEffort}
+            model={modelValue}
+            effort={effortValue}
             onModelChange={(m) => {
               onSelectAgent(agent);
+              if (entryHarness) writeLastModelForHarness(entryHarness, { model: m });
               setPickedModel(m);
             }}
             onEffortChange={(e) => {
               onSelectAgent(agent);
+              if (entryHarness) writeLastModelForHarness(entryHarness, { effort: e });
               setPickedEffort(e);
             }}
           />
@@ -1937,6 +1954,21 @@ export function NewChatLandingScreen() {
     if (supportsPermissionMode) {
       setPermissionMode(
         resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+      );
+      // The model + effort picker remembers its own last pick (same per-harness
+      // snapshot the mode knob uses), validated against the current vocab so a
+      // retired model/effort id falls back to the default.
+      const storedModel = readLastModelForHarness(selectedNativeHarness);
+      setPickedModel(
+        storedModel?.model != null && CLAUDE_NATIVE_MODELS.some((m) => m.id === storedModel.model)
+          ? storedModel.model
+          : CLAUDE_NATIVE_DEFAULT_MODEL,
+      );
+      setPickedEffort(
+        storedModel?.effort != null &&
+          CLAUDE_NATIVE_EFFORTS.some((e) => e.value === storedModel.effort)
+          ? storedModel.effort
+          : CLAUDE_NATIVE_DEFAULT_EFFORT,
       );
     } else if (supportsApprovalMode) {
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));

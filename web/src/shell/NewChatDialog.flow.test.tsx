@@ -737,6 +737,78 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.reasoning_effort).toBe("high");
   });
 
+  it("seeds the model + effort from the last pick for claude-native on a new session", async () => {
+    // A returning user's last model/effort pick for this harness is on record;
+    // the new session must auto-fill it and post it WITHOUT re-opening the
+    // picker — the same remember-your-pick behavior the permission mode has.
+    localStorage.setItem(
+      "omnigent:last-model-by-harness",
+      JSON.stringify({ "claude-native": { model: "opus", effort: "high" } }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("opus");
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("persists a picked model for claude-native, preserving the stored effort", async () => {
+    // Effort is already on record. Picking only the model must merge — not
+    // clobber — so the next session seeds BOTH from storage.
+    localStorage.setItem(
+      "omnigent:last-model-by-harness",
+      JSON.stringify({ "claude-native": { effort: "high" } }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_native");
+    fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("omnigent:last-model-by-harness") ?? "{}")).toEqual({
+        "claude-native": { model: "opus", effort: "high" },
+      }),
+    );
+  });
+
+  it("falls back to the model/effort default when the stored id has retired", async () => {
+    // A stale stored model no longer in the picker's vocab must not ride along —
+    // resolve to the default so the create never posts a dead model id.
+    localStorage.setItem(
+      "omnigent:last-model-by-harness",
+      JSON.stringify({ "claude-native": { model: "ancient-model", effort: "medium" } }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("sonnet");
+    expect(body.reasoning_effort).toBe("medium");
+  });
+
   it("omits model_override / reasoning_effort for a non-claude-native agent", async () => {
     // hello_world (harness null) has no permission-mode capability, so the
     // model/effort picker never renders and the create carries no model/effort.
