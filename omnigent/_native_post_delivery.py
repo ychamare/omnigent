@@ -362,6 +362,8 @@ async def replay_dead_letters(
     repost: Callable[[dict[str, object]], Coroutine[None, None, RepostResult]],
     retryable_status_codes: frozenset[int],
     logger_name: str | None = None,
+    max_records: int | None = None,
+    deadline_seconds: float | None = None,
 ) -> int:
     """
     Re-POST proven-undelivered dead-lettered forwards on forwarder startup (#1579).
@@ -375,6 +377,13 @@ async def replay_dead_letters(
     again. Ambiguous and permanent-4xx records are left untouched as a forensic
     record.
 
+    Bounded so a large dead-letter file or a slow/hung server cannot stall
+    startup: at most ``max_records`` records are re-POSTed and the whole drain
+    is abandoned once ``deadline_seconds`` elapses. Records left over by either
+    bound are retained unchanged (deferred to a later startup) and logged — never
+    silently dropped. The remaining latency lever, a short per-POST timeout and a
+    single attempt, is the caller's responsibility (via ``repost``).
+
     Intended to run once at startup, before live forwarding begins, so no other
     writer races the dead-letter files for this ``bridge_dir``.
 
@@ -387,6 +396,12 @@ async def replay_dead_letters(
         recoverable.
     :param logger_name: Optional logger name for the recovery summary line;
         defaults to this module's logger.
+    :param max_records: Maximum number of records to re-POST this run, e.g.
+        ``500``; ``None`` for no cap. Bounds the number of network POSTs (and
+        thus startup latency) even against a healthy server.
+    :param deadline_seconds: Wall-clock budget for the whole drain, e.g.
+        ``30.0``; ``None`` for no deadline. Once exceeded, the remaining
+        replayable records are deferred to a later startup.
     :returns: The number of records successfully replayed (and removed).
     """
     log = logging.getLogger(logger_name) if logger_name else _logger
@@ -411,6 +426,10 @@ async def replay_dead_letters(
         return 0
 
     replayed = 0
+    attempted = 0
+    deferred = 0
+    stop = False
+    deadline = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
     # ``loaded`` preserves the .1-then-current source order, so records replay
     # in the order they were originally dropped.
     for path, entries in loaded:
@@ -420,9 +439,24 @@ async def replay_dead_letters(
             if not _dead_letter_record_replayable(
                 entry, retryable_status_codes=retryable_status_codes
             ):
+                # Forensic record (ambiguous / permanent-4xx / malformed) — keep as is.
+                retained.append(entry)
+                continue
+            if stop:
+                deferred += 1
+                retained.append(entry)
+                continue
+            over_records = max_records is not None and attempted >= max_records
+            over_deadline = deadline is not None and time.monotonic() >= deadline
+            if over_records or over_deadline:
+                # Out of budget — defer this and every later replayable record
+                # to the next startup rather than stall here.
+                stop = True
+                deferred += 1
                 retained.append(entry)
                 continue
             assert isinstance(entry, dict)  # narrowed by _dead_letter_record_replayable
+            attempted += 1
             result = await repost(entry)
             if result.delivered:
                 replayed += 1
@@ -445,5 +479,13 @@ async def replay_dead_letters(
         log.info(
             "replayed %d proven-undelivered dead-lettered forward(s) on startup",
             replayed,
+        )
+    if deferred:
+        log.info(
+            "deferred %d replayable dead-lettered forward(s) to a later startup "
+            "(replay budget reached: max_records=%s deadline_seconds=%s)",
+            deferred,
+            max_records,
+            deadline_seconds,
         )
     return replayed

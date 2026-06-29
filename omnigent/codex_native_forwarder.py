@@ -64,6 +64,15 @@ _EMPTY_ROLLOUT_FRAGMENT = "is empty"
 _POST_MAX_ATTEMPTS = 3
 _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+# Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
+# or a slow/hung server cannot stall forwarder startup: each re-POST is a single
+# attempt (its natural retry is the next startup) with a short timeout (vs the
+# 30s live client default) so a hung server fails fast; at most
+# ``_REPLAY_MAX_RECORDS`` are sent and the whole drain is abandoned after
+# ``_REPLAY_DEADLINE_SECONDS``. Leftovers are deferred to a later startup.
+_REPLAY_MAX_RECORDS = 500
+_REPLAY_POST_TIMEOUT_SECONDS = 5.0
+_REPLAY_DEADLINE_SECONDS = 30.0
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
@@ -5429,7 +5438,12 @@ async def _replay_dead_letters_on_startup(
         assert isinstance(event_type, str)
         assert isinstance(payload, dict)
         result = await _post_session_event_inner(
-            ap_client, session_id, event_type=event_type, data=payload
+            ap_client,
+            session_id,
+            event_type=event_type,
+            data=payload,
+            max_attempts=1,
+            timeout=_REPLAY_POST_TIMEOUT_SECONDS,
         )
         response = result.response
         if response is None:
@@ -5451,6 +5465,8 @@ async def _replay_dead_letters_on_startup(
             repost=_repost,
             retryable_status_codes=_POST_RETRY_STATUS_CODES,
             logger_name=__name__,
+            max_records=_REPLAY_MAX_RECORDS,
+            deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
     except Exception:  # noqa: BLE001 - replay must never block forwarder startup.
         _logger.warning("Codex forwarder dead-letter replay failed", exc_info=True)
@@ -5540,6 +5556,8 @@ async def _post_session_event_inner(
     *,
     event_type: str,
     data: dict[str, Any],
+    max_attempts: int = _POST_MAX_ATTEMPTS,
+    timeout: float | None = None,
 ) -> _PostResult:
     """
     Post one Omnigent session event with bounded transient retries.
@@ -5550,6 +5568,12 @@ async def _post_session_event_inner(
         ``"external_conversation_item"``.
     :param data: Event data payload, e.g.
         ``{"status": "running"}``.
+    :param max_attempts: Maximum POST attempts before giving up, e.g. ``3``.
+        Startup dead-letter replay passes ``1`` — its natural retry cadence is
+        the next startup, so an in-call retry loop only adds latency (#1579).
+    :param timeout: Optional per-request timeout in seconds overriding the
+        client default, e.g. ``5.0``. Replay passes a short value so a hung
+        server fails fast instead of stalling startup on the 30s client default.
     :returns: A :class:`_PostResult` carrying the final response, or — when no
         response was seen — whether the POST was abandoned after an ambiguous
         transport failure (``external_conversation_item`` only; the item may
@@ -5558,9 +5582,12 @@ async def _post_session_event_inner(
     """
     url = f"/v1/sessions/{url_component(session_id)}/events"
     payload = {"type": event_type, "data": data}
-    for attempt in range(1, _POST_MAX_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
-            response = await client.post(url, json=payload)
+            if timeout is None:
+                response = await client.post(url, json=payload)
+            else:
+                response = await client.post(url, json=payload, timeout=timeout)
         except httpx.HTTPError as exc:
             # Conversation items persist with a random primary key and no
             # server-side dedup, so an ambiguous failure (request sent,
@@ -5581,55 +5608,58 @@ async def _post_session_event_inner(
                     delivered_ambiguous=True,
                     transport_error=type(exc).__name__,
                 )
-            if _is_final_post_attempt(attempt):
-                _log_post_transport_failure(event_type, exc)
+            if _is_final_post_attempt(attempt, max_attempts):
+                _log_post_transport_failure(event_type, exc, max_attempts)
                 return _PostResult(response=None, transport_error=type(exc).__name__)
             await _sleep(_post_retry_delay(attempt))
             continue
-        if _post_response_is_final(response, attempt):
+        if _post_response_is_final(response, attempt, max_attempts):
             return _PostResult(response=response)
         await _sleep(_post_retry_delay(attempt))
     return _PostResult(response=None)
 
 
-def _post_response_is_final(response: httpx.Response, attempt: int) -> bool:
+def _post_response_is_final(response: httpx.Response, attempt: int, max_attempts: int) -> bool:
     """
     Return whether a session-event POST response should stop retries.
 
     :param response: HTTP response from AP.
     :param attempt: One-based attempt number, e.g. ``1``.
+    :param max_attempts: Maximum POST attempts allowed, e.g. ``3``.
     :returns: ``True`` when the caller should return ``response``.
     """
     if response.status_code < 400:
         return True
     if not _should_retry_post_status(response.status_code):
         return True
-    return _is_final_post_attempt(attempt)
+    return _is_final_post_attempt(attempt, max_attempts)
 
 
-def _is_final_post_attempt(attempt: int) -> bool:
+def _is_final_post_attempt(attempt: int, max_attempts: int) -> bool:
     """
     Return whether an Omnigent event POST attempt is the final try.
 
     :param attempt: One-based attempt number, e.g. ``3``.
+    :param max_attempts: Maximum POST attempts allowed, e.g. ``3``.
     :returns: ``True`` when no further retry is allowed.
     """
-    return attempt >= _POST_MAX_ATTEMPTS
+    return attempt >= max_attempts
 
 
-def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError) -> None:
+def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError, max_attempts: int) -> None:
     """
     Log an exhausted Omnigent session-event transport failure.
 
     :param event_type: Session event type, e.g.
         ``"external_conversation_item"``.
     :param exc: Final transport error.
+    :param max_attempts: Number of attempts that were made, e.g. ``3``.
     :returns: None.
     """
     _logger.warning(
         "failed to post Codex session event after retries: type=%s attempts=%s error=%r",
         event_type,
-        _POST_MAX_ATTEMPTS,
+        max_attempts,
         exc,
     )
 

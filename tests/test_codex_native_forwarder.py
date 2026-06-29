@@ -1695,10 +1695,18 @@ async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
         transport_error="ConnectError",
     )
 
-    posted: list[tuple[str, str, dict]] = []
+    posted: list[dict] = []
 
-    async def _ok_inner(client, session_id, *, event_type, data):
-        posted.append((session_id, event_type, data))
+    async def _ok_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+        posted.append(
+            {
+                "session_id": session_id,
+                "event_type": event_type,
+                "data": data,
+                "max_attempts": max_attempts,
+                "timeout": timeout,
+            }
+        )
         return fwd._PostResult(
             response=httpx.Response(200, request=httpx.Request("POST", "http://test"))
         )
@@ -1706,7 +1714,14 @@ async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
     monkeypatch.setattr(fwd, "_post_session_event_inner", _ok_inner)
     await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
 
-    assert posted == [("conv_codex1", "external_conversation_item", {"item_type": "message"})]
+    assert len(posted) == 1
+    assert posted[0]["session_id"] == "conv_codex1"
+    assert posted[0]["event_type"] == "external_conversation_item"
+    assert posted[0]["data"] == {"item_type": "message"}
+    # Replay re-POSTs with a single attempt and a short timeout so a large file
+    # or a hung server cannot stall startup.
+    assert posted[0]["max_attempts"] == 1
+    assert posted[0]["timeout"] == fwd._REPLAY_POST_TIMEOUT_SECONDS
     # Delivered → record removed.
     assert not (tmp_path / "dead_letter.jsonl").exists()
 
@@ -1732,7 +1747,7 @@ async def test_replay_dead_letters_on_startup_skips_ambiguous(
 
     called = False
 
-    async def _inner(client, session_id, *, event_type, data):
+    async def _inner(client, session_id, *, event_type, data, **_kwargs):
         nonlocal called
         called = True
         return fwd._PostResult(
@@ -1745,3 +1760,40 @@ async def test_replay_dead_letters_on_startup_skips_ambiguous(
     assert called is False
     # Ambiguous record retained as a forensic record.
     assert (tmp_path / "dead_letter.jsonl").exists()
+
+
+class _RecordingPostClient:
+    """Async client stub that records each ``post`` call's kwargs."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+        self.calls: list[dict] = []
+
+    async def post(self, url: str, **kwargs: object) -> httpx.Response:
+        self.calls.append(kwargs)
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_single_attempt_and_timeout() -> None:
+    """
+    ``max_attempts=1`` makes one POST (no retry) and ``timeout`` is threaded through.
+
+    Replay relies on both so a hung server fails fast and startup is bounded (#1579).
+    """
+    client = _RecordingPostClient(
+        httpx.Response(503, request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+        max_attempts=1,
+        timeout=5.0,
+    )
+    # A single attempt even though 503 is normally retryable.
+    assert len(client.calls) == 1
+    assert client.calls[0]["timeout"] == 5.0
+    assert result.response is not None
+    assert result.response.status_code == 503

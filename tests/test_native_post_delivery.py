@@ -453,6 +453,68 @@ async def test_replay_with_no_dead_letter_files_is_a_noop(tmp_path: Path) -> Non
     assert called is False
 
 
+async def test_replay_respects_max_records(tmp_path: Path) -> None:
+    """
+    At most ``max_records`` records are re-POSTed; the rest are deferred (#1579).
+
+    Bounds startup latency even against a healthy server with a huge file. The
+    deferred records are retained unchanged for a later startup, not dropped.
+
+    :param tmp_path: Pytest temp dir standing in for a bridge dir.
+    """
+    current = tmp_path / _DEAD_LETTER_FILE
+    _write_records(current, [_dead_letter_record(payload={"n": i}) for i in range(3)])
+
+    seen: list[int] = []
+
+    async def repost(record: dict[str, object]) -> RepostResult:
+        seen.append(record["payload"]["n"])  # type: ignore[index]
+        return RepostResult(delivered=True)
+
+    replayed = await replay_dead_letters(
+        tmp_path, repost=repost, retryable_status_codes=_RETRYABLE, max_records=2
+    )
+
+    assert replayed == 2
+    # Only the first two were attempted, in order.
+    assert seen == [0, 1]
+    # The third was deferred and kept for next startup.
+    retained = _read_records(current)
+    assert [record["payload"]["n"] for record in retained] == [2]
+
+
+async def test_replay_respects_deadline(tmp_path: Path) -> None:
+    """
+    Once the deadline is exceeded, replay defers everything (no re-POST) (#1579).
+
+    A zero budget defers before the first attempt, leaving the file untouched.
+
+    :param tmp_path: Pytest temp dir standing in for a bridge dir.
+    """
+    current = tmp_path / _DEAD_LETTER_FILE
+    _write_records(
+        current,
+        [_dead_letter_record(payload={"n": 0}), _dead_letter_record(payload={"n": 1})],
+    )
+    before = current.read_bytes()
+
+    called = False
+
+    async def repost(record: dict[str, object]) -> RepostResult:
+        nonlocal called
+        called = True
+        return RepostResult(delivered=True)
+
+    replayed = await replay_dead_letters(
+        tmp_path, repost=repost, retryable_status_codes=_RETRYABLE, deadline_seconds=0.0
+    )
+
+    assert replayed == 0
+    assert called is False
+    # Nothing changed, so the file is left byte-identical for the next startup.
+    assert current.read_bytes() == before
+
+
 async def test_replay_preserves_malformed_lines(tmp_path: Path) -> None:
     """
     A malformed (unparseable) line is retained verbatim across a replay rewrite.
