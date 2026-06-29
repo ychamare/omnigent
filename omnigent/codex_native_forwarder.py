@@ -5072,7 +5072,7 @@ async def _persist_codex_compaction_item(
                 codex_home = Path(state.codex_home)
                 thread_id = state.thread_id
                 rollout_files = sorted(
-                    codex_home.glob(f"sessions/*/*rollout-*{thread_id}.jsonl"),
+                    codex_home.glob(f"sessions/**/*rollout-*{thread_id}.jsonl"),
                     key=lambda p: p.stat().st_mtime,
                     reverse=True,
                 )
